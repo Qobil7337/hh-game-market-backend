@@ -16,7 +16,8 @@
     "start:prod": "node dist/main",
     "test": "vitest run",
     "pay": "node scripts/pay.mjs",
-    "race": "node scripts/pay.mjs --n 50"
+    "race": "node scripts/pay.mjs --n 50",
+    "stub": "node scripts/stub.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",

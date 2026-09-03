@@ -52,13 +52,16 @@ export async function startApp(): Promise<TestApp> {
 
   const { port } = app.getHttpServer().address() as AddressInfo;
   const baseUrl = `http://127.0.0.1:${port}/api`;
-  // Point the delivery worker at the stub served by this instance.
+  // Point the delivery worker at the stubs served by this instance.
   process.env.SUPPLIER_A_URL = `${baseUrl}/stubs/suppliers/a`;
+  process.env.SUPPLIER_B_URL = `${baseUrl}/stubs/suppliers/b`;
 
   const api = async (method: string, path: string, body?: unknown) => {
     const response = await fetch(`${baseUrl}${path}`, {
       method,
-      headers: { 'content-type': 'application/json' },
+      // Fastify rejects a JSON content-type with an empty body, so only send it
+      // alongside one.
+      headers: body === undefined ? {} : { 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     return { status: response.status, body: await response.json() };
@@ -96,7 +99,7 @@ export async function resetDatabase(app: NestFastifyApplication) {
   await app
     .get(DataSource)
     .query(
-      'TRUNCATE TABLE orders, payment_events, deliveries, supplier_keys RESTART IDENTITY CASCADE',
+      'TRUNCATE TABLE orders, payment_events, deliveries, delivery_attempts, supplier_keys RESTART IDENTITY CASCADE',
     );
   await app.get(SeedService).seed();
 }
@@ -114,6 +117,41 @@ export function paymentEvent(
     created_at: new Date().toISOString(),
     ...overrides,
   };
+}
+
+export async function pay(t: TestApp, order: OrderRef) {
+  const { body } = await t.api(
+    'POST',
+    '/webhooks/payment',
+    paymentEvent(order),
+  );
+  expect(body).toEqual({ result: 'applied' });
+}
+
+export async function setStub(
+  t: TestApp,
+  supplier: string,
+  config: { errorRate?: number; timeoutRate?: number; hangMs?: number },
+) {
+  const { status } = await t.api(
+    'PUT',
+    `/stubs/suppliers/${supplier}/config`,
+    config,
+  );
+  expect(status).toBe(200);
+}
+
+// Keys the stubs have handed out for this order, across both suppliers.
+export function issuedKeys(
+  app: NestFastifyApplication,
+  orderId: string,
+): Promise<{ supplier: string; code: string; requestId: string }[]> {
+  return app
+    .get(DataSource)
+    .query(
+      'SELECT supplier, code, request_id AS "requestId" FROM supplier_keys WHERE order_id = $1 ORDER BY issued_at',
+      [orderId],
+    );
 }
 
 // What "exactly once, nothing lost" boils down to, checked straight in the

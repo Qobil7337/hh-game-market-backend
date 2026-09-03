@@ -26,7 +26,7 @@ const { values: opts } = parseArgs({
 async function api(method, path, body) {
   const response = await fetch(`${opts.base}${path}`, {
     method,
-    headers: { 'content-type': 'application/json' },
+    headers: body === undefined ? {} : { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   return { status: response.status, body: await response.json() };

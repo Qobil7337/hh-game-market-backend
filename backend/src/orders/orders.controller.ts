@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post } from '@nestjs/common';
 import { CreateOrderDto } from './dto/create-order.dto.js';
 import { OrdersService } from './orders.service.js';
 
@@ -14,5 +14,12 @@ export class OrdersController {
   @Get(':id')
   get(@Param('id') id: string) {
     return this.orders.get(id);
+  }
+
+  // Manual re-delivery for out_of_stock / delivery_failed orders.
+  @Post(':id/deliver')
+  @HttpCode(200)
+  retry(@Param('id') id: string) {
+    return this.orders.retryDelivery(id);
   }
 }
