@@ -1,9 +1,13 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { AppController } from './app.controller.js';
-import { AppService } from './app.service.js';
+import { CatalogModule } from './catalog/catalog.module.js';
+import { DeliveryModule } from './delivery/delivery.module.js';
 import { HealthModule } from './health/health.module.js';
+import { OrdersModule } from './orders/orders.module.js';
+import { PaymentsModule } from './payments/payments.module.js';
+import { SeedModule } from './seed/seed.module.js';
+import { SupplierStubModule } from './stubs/supplier/supplier-stub.module.js';
 
 @Module({
   imports: [
@@ -21,9 +25,13 @@ import { HealthModule } from './health/health.module.js';
         synchronize: config.get('NODE_ENV') !== 'production',
       }),
     }),
+    CatalogModule,
+    OrdersModule,
+    PaymentsModule,
+    DeliveryModule,
+    SupplierStubModule,
+    SeedModule,
     HealthModule,
   ],
-  controllers: [AppController],
-  providers: [AppService],
 })
 export class AppModule {}
