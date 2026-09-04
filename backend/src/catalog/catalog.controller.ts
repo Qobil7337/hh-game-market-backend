@@ -1,16 +1,14 @@
-import { Controller, Get } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { Product } from './product.entity.js';
+import { Controller, Get, Query } from '@nestjs/common';
+import { CatalogService } from './catalog.service.js';
+import { StorefrontQueryDto } from './dto/storefront-query.dto.js';
 
 @Controller('products')
 export class CatalogController {
-  constructor(
-    @InjectRepository(Product) private readonly products: Repository<Product>,
-  ) {}
+  constructor(private readonly catalog: CatalogService) {}
 
+  // GET /products?type=key&limit=50&cursor=<last sku of the previous page>
   @Get()
-  list() {
-    return this.products.find({ order: { sku: 'ASC' } });
+  list(@Query() query: StorefrontQueryDto) {
+    return this.catalog.storefront(query);
   }
 }

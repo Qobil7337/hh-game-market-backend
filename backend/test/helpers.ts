@@ -99,7 +99,7 @@ export async function resetDatabase(app: NestFastifyApplication) {
   await app
     .get(DataSource)
     .query(
-      'TRUNCATE TABLE orders, payment_events, deliveries, delivery_attempts, supplier_keys RESTART IDENTITY CASCADE',
+      'TRUNCATE TABLE orders, payment_events, deliveries, delivery_attempts, ledger_entries, supplier_keys, products, product_stock RESTART IDENTITY CASCADE',
     );
   await app.get(SeedService).seed();
 }
@@ -165,7 +165,10 @@ export async function expectConsistent(app: NestFastifyApplication) {
       (SELECT count(*) FROM deliveries)::int AS deliveries,
       (SELECT count(DISTINCT code) FROM deliveries)::int AS distinct_codes,
       (SELECT count(*) FROM supplier_keys WHERE request_id IS NOT NULL)::int AS issued_keys,
-      (SELECT count(*) FROM payment_events WHERE status = 'paid' AND outcome = 'applied')::int AS applied_paid
+      (SELECT count(*) FROM payment_events WHERE status = 'paid' AND outcome = 'applied')::int AS applied_paid,
+      (SELECT coalesce(sum(amount), 0) FROM ledger_entries)::int AS ledger_total,
+      (SELECT coalesce(-sum(amount) FILTER (WHERE account = 'revenue'), 0) FROM ledger_entries)::int AS revenue,
+      (SELECT coalesce(sum(amount), 0) FROM orders WHERE status = 'delivered')::int AS delivered_amount
   `);
 
   expect(counts.in_flight).toBe(0);
@@ -176,4 +179,7 @@ export async function expectConsistent(app: NestFastifyApplication) {
   expect(counts.issued_keys).toBe(counts.deliveries);
   // Exactly one paid event was honoured per delivered order.
   expect(counts.applied_paid).toBe(counts.delivered);
+  // The ledger sums to zero and recognised revenue equals what was delivered.
+  expect(counts.ledger_total).toBe(0);
+  expect(counts.revenue).toBe(counts.delivered_amount);
 }

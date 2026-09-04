@@ -1,6 +1,8 @@
-import { Column, Entity, PrimaryColumn } from 'typeorm';
+import { Column, Entity, Index, PrimaryColumn } from 'typeorm';
 
 @Entity('products')
+// Drives the storefront listing: type filter + sku order, only over active rows.
+@Index('products_type_sku_active_idx', ['type', 'sku'], { where: 'active' })
 export class Product {
   @PrimaryColumn()
   sku: string;
@@ -20,4 +22,7 @@ export class Product {
 
   @Column()
   image: string;
+
+  @Column({ default: true })
+  active: boolean;
 }

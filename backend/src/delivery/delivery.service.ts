@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
+import { CatalogService } from '../catalog/catalog.service.js';
+import { LedgerService } from '../ledger/ledger.service.js';
 import { transitionOrder } from '../orders/order-transition.js';
 import { Order, OrderStatus } from '../orders/order.entity.js';
 import { DeliveryAttempt } from './delivery-attempt.entity.js';
@@ -31,6 +33,8 @@ export class DeliveryService {
     private readonly dataSource: DataSource,
     private readonly client: SupplierClient,
     private readonly config: ConfigService,
+    private readonly ledger: LedgerService,
+    private readonly catalog: CatalogService,
   ) {}
 
   // The order is already `delivering` when this is called.
@@ -124,9 +128,16 @@ export class DeliveryService {
         detail,
         latencyMs,
       });
-      this.logger.log(
-        `order=${order.id} supplier=${supplier} attempt=${attempt} outcome=${outcome} latency=${latencyMs}ms${detail ? ` (${detail})` : ''}`,
-      );
+      this.logger.log({
+        event: 'delivery.attempt',
+        orderId: order.id,
+        supplier,
+        requestId,
+        attempt,
+        outcome,
+        latencyMs,
+        detail,
+      });
 
       if (result.ok) {
         return { kind: 'ok', requestId, code: result.code };
@@ -147,6 +158,8 @@ export class DeliveryService {
     return { kind: ambiguous ? 'ambiguous' : 'failed' };
   }
 
+  // Everything that makes the delivery final happens in one transaction: the
+  // delivery row, the status, the ledger postings and the stock counter.
   private async complete(
     order: Order,
     supplier: string,
@@ -174,18 +187,30 @@ export class DeliveryService {
         OrderStatus.Delivering,
         OrderStatus.Delivered,
       );
+      await this.ledger.recordDelivery(em, order);
+      await this.catalog.decrementStock(em, order.sku);
     });
 
-    this.logger.log(`order=${order.id} supplier=${supplier} -> delivered`);
+    this.logger.log({
+      event: 'delivery.completed',
+      orderId: order.id,
+      supplier,
+      requestId,
+    });
   }
 
-  private async park(order: Order, status: OrderStatus, why: string) {
+  private async park(order: Order, status: OrderStatus, reason: string) {
     await transitionOrder(
       this.dataSource.manager,
       order.id,
       OrderStatus.Delivering,
       status,
     );
-    this.logger.warn(`order=${order.id} -> ${status}: ${why}`);
+    this.logger.warn({
+      event: 'delivery.parked',
+      orderId: order.id,
+      status,
+      reason,
+    });
   }
 }

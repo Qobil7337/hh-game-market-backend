@@ -1,9 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { AdminModule } from './admin/admin.module.js';
 import { CatalogModule } from './catalog/catalog.module.js';
 import { DeliveryModule } from './delivery/delivery.module.js';
 import { HealthModule } from './health/health.module.js';
+import { LedgerModule } from './ledger/ledger.module.js';
 import { OrdersModule } from './orders/orders.module.js';
 import { PaymentsModule } from './payments/payments.module.js';
 import { SeedModule } from './seed/seed.module.js';
@@ -29,7 +31,9 @@ import { SupplierStubModule } from './stubs/supplier/supplier-stub.module.js';
     OrdersModule,
     PaymentsModule,
     DeliveryModule,
+    LedgerModule,
     SupplierStubModule,
+    AdminModule,
     SeedModule,
     HealthModule,
   ],

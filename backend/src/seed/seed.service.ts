@@ -1,8 +1,11 @@
 import { Injectable, OnApplicationBootstrap } from '@nestjs/common';
 import { DataSource } from 'typeorm';
+import { ProductStock } from '../catalog/product-stock.entity.js';
 import { Product } from '../catalog/product.entity.js';
 import { SupplierKey } from '../stubs/supplier/supplier-key.entity.js';
 import { KEYS, PRODUCTS } from './data.js';
+
+const INITIAL_STOCK = 100;
 
 @Injectable()
 export class SeedService implements OnApplicationBootstrap {
@@ -19,6 +22,14 @@ export class SeedService implements OnApplicationBootstrap {
       .insert()
       .into(Product)
       .values(PRODUCTS)
+      .orIgnore()
+      .execute();
+
+    await this.dataSource
+      .createQueryBuilder()
+      .insert()
+      .into(ProductStock)
+      .values(PRODUCTS.map(({ sku }) => ({ sku, available: INITIAL_STOCK })))
       .orIgnore()
       .execute();
 

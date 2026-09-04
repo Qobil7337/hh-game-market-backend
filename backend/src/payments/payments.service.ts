@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { isUUID } from 'class-validator';
 import { DataSource, EntityManager } from 'typeorm';
 import { DeliveryWorker } from '../delivery/delivery.worker.js';
+import { LedgerService } from '../ledger/ledger.service.js';
 import { transitionOrder } from '../orders/order-transition.js';
 import { Order, OrderStatus } from '../orders/order.entity.js';
 import { PaymentWebhookDto } from './dto/payment-webhook.dto.js';
@@ -21,6 +22,7 @@ export class PaymentsService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly worker: DeliveryWorker,
+    private readonly ledger: LedgerService,
   ) {}
 
   // Everything happens in one short transaction so the response is fast and the
@@ -63,9 +65,15 @@ export class PaymentsService {
       return outcome;
     });
 
-    this.logger.log(
-      `event=${dto.event_id} order=${dto.order_id} status=${dto.status} outcome=${outcome}`,
-    );
+    this.logger.log({
+      event: 'payment.webhook',
+      eventId: dto.event_id,
+      orderId: dto.order_id,
+      status: dto.status,
+      amount: dto.amount,
+      currency: dto.currency,
+      outcome,
+    });
 
     if (outcome === 'applied' && dto.status === 'paid') {
       this.worker.wake();
@@ -101,6 +109,7 @@ export class PaymentsService {
     }
 
     await transitionOrder(em, order.id, OrderStatus.Created, OrderStatus.Paid);
+    await this.ledger.recordPayment(em, order, dto.event_id);
     return 'applied';
   }
 }
