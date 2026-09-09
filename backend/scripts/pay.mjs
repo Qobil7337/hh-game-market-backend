@@ -4,6 +4,7 @@
 // answered each one and where the order ended up.
 //
 //   node scripts/pay.mjs                        pay a fresh KEY-GTA5 order once
+//   node scripts/pay.mjs --sku KEY-GTA5,KEY-EFT,SUB-YT-3M   multi-item order
 //   node scripts/pay.mjs --n 50                 50 redeliveries of one event_id
 //   node scripts/pay.mjs --n 50 --distinct      50 different event_ids, same order
 //   node scripts/pay.mjs --status failed        send a failed event instead
@@ -34,14 +35,19 @@ async function api(method, path, body) {
 
 const order = opts.order
   ? (await api('GET', `/orders/${opts.order}`)).body
-  : (await api('POST', '/orders', { sku: opts.sku })).body;
+  : (
+      await api('POST', '/orders', {
+        items: opts.sku.split(',').map((sku) => ({ sku })),
+      })
+    ).body;
 
 if (!order.id) {
   console.error('could not get an order:', order);
   process.exit(1);
 }
+const skus = order.items.map((item) => item.sku).join(', ');
 console.log(
-  `order ${order.id}  ${order.sku}  ${order.amount} ${order.currency}  status=${order.status}`,
+  `order ${order.id}  [${skus}]  ${order.amount} ${order.currency}  status=${order.status}`,
 );
 
 const n = Number(opts.n);
@@ -70,8 +76,9 @@ console.log(`${n} webhook(s) in ${elapsed}ms:`, tally);
 
 const finalStates = new Set([
   'delivered',
+  'partially_delivered',
+  'refunded',
   'payment_failed',
-  'out_of_stock',
   'delivery_failed',
 ]);
 const deadline = Date.now() + 15_000;
@@ -81,7 +88,14 @@ while (!finalStates.has(current.status) && Date.now() < deadline) {
   current = (await api('GET', `/orders/${order.id}`)).body;
 }
 
-const delivery = current.delivery
-  ? `  code=${current.delivery.code}  supplier=${current.delivery.supplier}`
-  : '';
-console.log(`final status=${current.status}${delivery}`);
+console.log(
+  `final status=${current.status}  money=${JSON.stringify(current.money)}`,
+);
+for (const item of current.items) {
+  const detail = item.delivery
+    ? `code=${item.delivery.code} supplier=${item.delivery.supplier}`
+    : item.refund
+      ? `refunded ${item.refund.amount} (${item.refund.reason})`
+      : '';
+  console.log(`  ${item.sku.padEnd(16)} ${item.status.padEnd(10)} ${detail}`);
+}

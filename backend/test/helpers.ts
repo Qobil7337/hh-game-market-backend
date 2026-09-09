@@ -27,7 +27,8 @@ export interface TestApp {
   app: NestFastifyApplication;
   baseUrl: string;
   api(method: string, path: string, body?: unknown): Promise<ApiResponse>;
-  createOrder(sku?: string): Promise<OrderRef>;
+  // One sku, or a list of skus (repeats allowed) for a multi-item order.
+  createOrder(skus?: string | string[]): Promise<OrderRef>;
   waitForStatus(
     orderId: string,
     expected: string | string[],
@@ -55,6 +56,7 @@ export async function startApp(): Promise<TestApp> {
   // Point the delivery worker at the stubs served by this instance.
   process.env.SUPPLIER_A_URL = `${baseUrl}/stubs/suppliers/a`;
   process.env.SUPPLIER_B_URL = `${baseUrl}/stubs/suppliers/b`;
+  process.env.PSP_URL = `${baseUrl}/stubs/payments`;
 
   const api = async (method: string, path: string, body?: unknown) => {
     const response = await fetch(`${baseUrl}${path}`, {
@@ -67,8 +69,11 @@ export async function startApp(): Promise<TestApp> {
     return { status: response.status, body: await response.json() };
   };
 
-  const createOrder = async (sku = 'KEY-GTA5') => {
-    const { status, body } = await api('POST', '/orders', { sku });
+  const createOrder = async (skus: string | string[] = 'KEY-GTA5') => {
+    const payload = Array.isArray(skus)
+      ? { items: skus.map((sku) => ({ sku })) }
+      : { sku: skus };
+    const { status, body } = await api('POST', '/orders', payload);
     expect(status).toBe(201);
     return body as OrderRef;
   };
@@ -99,7 +104,7 @@ export async function resetDatabase(app: NestFastifyApplication) {
   await app
     .get(DataSource)
     .query(
-      'TRUNCATE TABLE orders, payment_events, deliveries, delivery_attempts, ledger_entries, supplier_keys, products, product_stock RESTART IDENTITY CASCADE',
+      'TRUNCATE TABLE orders, order_items, payment_events, deliveries, delivery_attempts, refunds, ledger_entries, supplier_keys, psp_refunds, products, product_stock RESTART IDENTITY CASCADE',
     );
   await app.get(SeedService).seed();
 }
@@ -131,13 +136,23 @@ export async function pay(t: TestApp, order: OrderRef) {
 export async function setStub(
   t: TestApp,
   supplier: string,
-  config: { errorRate?: number; timeoutRate?: number; hangMs?: number },
+  config: {
+    errorRate?: number;
+    timeoutRate?: number;
+    hangMs?: number;
+    unavailableSkus?: string[];
+  },
 ) {
   const { status } = await t.api(
     'PUT',
     `/stubs/suppliers/${supplier}/config`,
     config,
   );
+  expect(status).toBe(200);
+}
+
+export async function setPsp(t: TestApp, config: { errorRate?: number }) {
+  const { status } = await t.api('PUT', '/stubs/payments/config', config);
   expect(status).toBe(200);
 }
 
@@ -154,32 +169,55 @@ export function issuedKeys(
     );
 }
 
-// What "exactly once, nothing lost" boils down to, checked straight in the
-// database once every order in the test has settled. Only valid while the
-// supplier is healthy: every paid order must then end up delivered.
+// What "exactly once, nothing lost, money adds up" boils down to, checked
+// straight in the database once every order in the test has settled.
 export async function expectConsistent(app: NestFastifyApplication) {
   const [counts] = await app.get(DataSource).query(`
     SELECT
-      (SELECT count(*) FROM orders WHERE status = 'delivered')::int AS delivered,
       (SELECT count(*) FROM orders WHERE status IN ('paid', 'delivering'))::int AS in_flight,
+      (SELECT count(*) FROM orders WHERE status NOT IN ('created', 'payment_failed'))::int AS paid_orders,
+      (SELECT count(*) FROM order_items WHERE status = 'delivered')::int AS delivered_items,
+      (SELECT count(*) FROM order_items WHERE status = 'refunded')::int AS refunded_items,
       (SELECT count(*) FROM deliveries)::int AS deliveries,
       (SELECT count(DISTINCT code) FROM deliveries)::int AS distinct_codes,
       (SELECT count(*) FROM supplier_keys WHERE request_id IS NOT NULL)::int AS issued_keys,
+      (SELECT count(*) FROM refunds)::int AS refunds,
+      (SELECT count(*) FROM psp_refunds)::int AS psp_refunds,
       (SELECT count(*) FROM payment_events WHERE status = 'paid' AND outcome = 'applied')::int AS applied_paid,
       (SELECT coalesce(sum(amount), 0) FROM ledger_entries)::int AS ledger_total,
       (SELECT coalesce(-sum(amount) FILTER (WHERE account = 'revenue'), 0) FROM ledger_entries)::int AS revenue,
-      (SELECT coalesce(sum(amount), 0) FROM orders WHERE status = 'delivered')::int AS delivered_amount
+      (SELECT coalesce(-sum(amount) FILTER (WHERE account = 'cash' AND reason = 'refund'), 0) FROM ledger_entries)::int AS refunded,
+      (SELECT coalesce(sum(amount), 0) FROM order_items WHERE status = 'delivered')::int AS delivered_amount,
+      (SELECT coalesce(sum(amount), 0) FROM refunds)::int AS refunded_amount,
+      (SELECT coalesce(sum(amount), 0) FROM psp_refunds)::int AS psp_refunded_amount,
+      (SELECT count(*) FROM orders o WHERE o.status NOT IN ('created', 'payment_failed')
+         AND o.amount <> (SELECT sum(i.amount) FROM order_items i
+                          WHERE i.order_id = o.id AND i.status IN ('delivered', 'refunded', 'pending', 'refunding')))::int AS unbalanced_orders,
+      (SELECT count(*) FROM orders o WHERE o.status IN ('delivered', 'partially_delivered', 'refunded')
+         AND EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.status IN ('pending', 'refunding')))::int AS final_with_open_items
   `);
 
   expect(counts.in_flight).toBe(0);
-  // One delivery row per delivered order, each with its own code.
-  expect(counts.deliveries).toBe(counts.delivered);
+  // One delivery row per delivered item, each with its own code.
+  expect(counts.deliveries).toBe(counts.delivered_items);
   expect(counts.distinct_codes).toBe(counts.deliveries);
-  // No key was consumed at the supplier without reaching an order.
+  // No key was consumed at the supplier without reaching an item. Only valid
+  // once every order has settled: an ambiguous timeout leaves a key behind
+  // until the retry collects it.
   expect(counts.issued_keys).toBe(counts.deliveries);
-  // Exactly one paid event was honoured per delivered order.
-  expect(counts.applied_paid).toBe(counts.delivered);
-  // The ledger sums to zero and recognised revenue equals what was delivered.
+  // Exactly one paid event was honoured per paid order.
+  expect(counts.applied_paid).toBe(counts.paid_orders);
+  // One refund per refunded item, and the provider saw each of them once.
+  expect(counts.refunds).toBe(counts.refunded_items);
+  expect(counts.psp_refunds).toBe(counts.refunded_items);
+  expect(counts.psp_refunded_amount).toBe(counts.refunded_amount);
+  // The ledger sums to zero, recognised revenue equals what was delivered and
+  // refunded cash equals what was refunded.
   expect(counts.ledger_total).toBe(0);
   expect(counts.revenue).toBe(counts.delivered_amount);
+  expect(counts.refunded).toBe(counts.refunded_amount);
+  // Per order: paid = delivered + refunded + still open, and nothing is open
+  // once the order is final.
+  expect(counts.unbalanced_orders).toBe(0);
+  expect(counts.final_with_open_items).toBe(0);
 }

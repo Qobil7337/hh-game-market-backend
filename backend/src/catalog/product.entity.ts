@@ -23,6 +23,10 @@ export class Product {
   @Column()
   image: string;
 
+  // Which supplier stocks this SKU; the others are only fallbacks.
+  @Column({ default: 'a' })
+  supplier: string;
+
   @Column({ default: true })
   active: boolean;
 }

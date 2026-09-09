@@ -69,7 +69,7 @@ describe('recovery sweep', () => {
 
     process.env.DELIVERY_CONCURRENCY = '2';
     const delivered = await t.waitForStatus(order.id, 'delivered');
-    expect(delivered.delivery.supplier).toBe('a');
+    expect(delivered.items[0].delivery.supplier).toBe('a');
     await expectConsistent(t.app);
   });
 
@@ -95,7 +95,7 @@ describe('recovery sweep', () => {
     });
 
     const delivered = await t.waitForStatus(order.id, 'delivered');
-    expect(delivered.delivery).toMatchObject({
+    expect(delivered.items[0].delivery).toMatchObject({
       supplier: 'a',
       code: held.code,
     });
@@ -162,6 +162,7 @@ describe('reconciliation and ledger', () => {
       unmatchedEvents: 1,
       paidAfterFailure: 1,
       supplierKeysWithoutDelivery: 1,
+      moneyMismatches: 0,
       supplierCodeMismatches: 0,
     });
     expect(body.paidNotDelivered[0]).toMatchObject({
@@ -214,7 +215,12 @@ describe('reconciliation and ledger', () => {
     const { body } = await t.api('GET', '/admin/reconciliation');
     expect(body.healthy).toBe(false);
     expect(body.deliveredNotPaid).toEqual([
-      { id: order.id, status: 'delivered', code: null },
+      {
+        id: order.id,
+        itemId: expect.any(String),
+        status: 'delivered',
+        code: null,
+      },
     ]);
   });
 });

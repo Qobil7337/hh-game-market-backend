@@ -9,6 +9,7 @@ import { LedgerModule } from './ledger/ledger.module.js';
 import { OrdersModule } from './orders/orders.module.js';
 import { PaymentsModule } from './payments/payments.module.js';
 import { SeedModule } from './seed/seed.module.js';
+import { PaymentStubModule } from './stubs/payment/payment-stub.module.js';
 import { SupplierStubModule } from './stubs/supplier/supplier-stub.module.js';
 
 @Module({
@@ -33,6 +34,7 @@ import { SupplierStubModule } from './stubs/supplier/supplier-stub.module.js';
     DeliveryModule,
     LedgerModule,
     SupplierStubModule,
+    PaymentStubModule,
     AdminModule,
     SeedModule,
     HealthModule,

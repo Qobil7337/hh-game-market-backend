@@ -47,12 +47,9 @@ export class RecoveryService implements OnModuleInit, OnModuleDestroy {
     // `delivering` for longer than any delivery can take means the worker died
     // mid-flight (or lost its database connection) before finishing.
     const stale = await this.requeue([OrderStatus.Delivering], staleMs);
-    // Parked orders get another go once the cooldown has passed: stock may be
-    // back, a supplier may be up again.
-    const parked = await this.requeue(
-      [OrderStatus.OutOfStock, OrderStatus.DeliveryFailed],
-      retryMs,
-    );
+    // Parked orders get another go once the cooldown has passed: the supplier
+    // that timed out may answer now, the refund call may go through.
+    const parked = await this.requeue([OrderStatus.DeliveryFailed], retryMs);
 
     if (stale.length > 0 || parked.length > 0) {
       this.logger.log({ event: 'recovery.sweep', stale, parked });

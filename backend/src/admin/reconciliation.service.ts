@@ -19,31 +19,59 @@ export class ReconciliationService {
     const [
       paidNotDelivered,
       deliveredNotPaid,
+      moneyMismatches,
       unmatchedEvents,
       paidAfterFailure,
       supplierKeysWithoutDelivery,
       supplierCodeMismatches,
       ledger,
     ] = await Promise.all([
-      // Money in, nothing out yet. Expected to be transient; anything old is stuck.
+      // Money in, not every item settled yet. Expected to be transient; anything
+      // old is stuck.
       q(`
-        SELECT id, sku, amount, currency, status, updated_at AS "updatedAt",
-               extract(epoch FROM now() - updated_at)::int AS "ageSeconds"
-        FROM orders
-        WHERE status IN ('paid', 'delivering', 'out_of_stock', 'delivery_failed')
-        ORDER BY updated_at
+        SELECT o.id, o.amount, o.currency, o.status, o.updated_at AS "updatedAt",
+               extract(epoch FROM now() - o.updated_at)::int AS "ageSeconds",
+               (SELECT count(*) FROM order_items i
+                 WHERE i.order_id = o.id AND i.status IN ('pending', 'refunding'))::int AS "openItems"
+        FROM orders o
+        WHERE o.status IN ('paid', 'delivering', 'delivery_failed')
+        ORDER BY o.updated_at
         LIMIT ${LIMIT}
       `),
-      // Must be empty: a delivered order without a delivery row, or a delivery
+      // Must be empty: a delivered item without a delivery row, or a delivery
       // for an order that never had a paid event applied.
       q(`
-        SELECT o.id, o.status, d.code
-        FROM orders o
-        LEFT JOIN deliveries d ON d.order_id = o.id
-        WHERE (o.status = 'delivered' AND d.id IS NULL)
+        SELECT i.order_id AS id, i.id AS "itemId", i.status, d.code
+        FROM order_items i
+        LEFT JOIN deliveries d ON d.order_item_id = i.id
+        WHERE (i.status = 'delivered' AND d.id IS NULL)
            OR (d.id IS NOT NULL AND NOT EXISTS (
                  SELECT 1 FROM payment_events e
-                 WHERE e.order_id = o.id::text AND e.status = 'paid' AND e.outcome = 'applied'))
+                 WHERE e.order_id = i.order_id::text AND e.status = 'paid' AND e.outcome = 'applied'))
+        LIMIT ${LIMIT}
+      `),
+      // Must be empty: for every paid order, paid = delivered + refunded + still
+      // open, both by item status and by ledger postings; a final order has
+      // nothing open.
+      q(`
+        SELECT * FROM (
+          SELECT o.id, o.status, o.amount AS paid,
+                 coalesce(sum(i.amount) FILTER (WHERE i.status = 'delivered'), 0)::int               AS delivered,
+                 coalesce(sum(i.amount) FILTER (WHERE i.status = 'refunded'), 0)::int                AS refunded,
+                 coalesce(sum(i.amount) FILTER (WHERE i.status IN ('pending', 'refunding')), 0)::int AS pending,
+                 (SELECT coalesce(sum(amount), 0) FROM ledger_entries l
+                   WHERE l.order_id = o.id AND l.account = 'cash')::int                              AS "ledgerCash",
+                 (SELECT coalesce(-sum(amount), 0) FROM ledger_entries l
+                   WHERE l.order_id = o.id AND l.account = 'revenue')::int                           AS "ledgerRevenue"
+          FROM orders o
+          JOIN order_items i ON i.order_id = o.id
+          WHERE o.status NOT IN ('created', 'payment_failed')
+          GROUP BY o.id
+        ) t
+        WHERE paid <> delivered + refunded + pending
+           OR "ledgerCash" <> paid - refunded
+           OR "ledgerRevenue" <> delivered
+           OR (status IN ('delivered', 'partially_delivered', 'refunded') AND pending > 0)
         LIMIT ${LIMIT}
       `),
       // Events we could not apply: money possibly received for nothing we can deliver.
@@ -64,27 +92,26 @@ export class ReconciliationService {
         ORDER BY received_at DESC
         LIMIT ${LIMIT}
       `),
-      // Keys a supplier holds for an order that has no delivery yet: the trace
+      // Keys a supplier holds for a request we have no delivery for: the trace
       // an ambiguous timeout leaves behind until recovery resolves it.
       q(`
         SELECT k.supplier, k.request_id AS "requestId", k.order_id AS "orderId",
                o.status, k.issued_at AS "issuedAt"
         FROM supplier_keys k
         LEFT JOIN orders o ON o.id::text = k.order_id
-        LEFT JOIN deliveries d ON d.order_id = o.id
+        LEFT JOIN deliveries d ON d.request_id = k.request_id
         WHERE k.request_id IS NOT NULL AND d.id IS NULL
         ORDER BY k.issued_at
         LIMIT ${LIMIT}
       `),
-      // Must be empty: a supplier issued a code for an order that was delivered
+      // Must be empty: a supplier issued a code for a request that was delivered
       // with a different one, i.e. a second key was consumed.
       q(`
         SELECT k.supplier, k.request_id AS "requestId", k.order_id AS "orderId",
                d.supplier AS "deliveredBy"
         FROM supplier_keys k
-        JOIN orders o ON o.id::text = k.order_id
-        JOIN deliveries d ON d.order_id = o.id
-        WHERE k.request_id IS NOT NULL AND d.code <> k.code
+        JOIN deliveries d ON d.request_id = k.request_id
+        WHERE d.code <> k.code
         LIMIT ${LIMIT}
       `),
       this.ledger.balances(),
@@ -94,11 +121,13 @@ export class ReconciliationService {
       generatedAt: new Date(),
       healthy:
         deliveredNotPaid.length === 0 &&
+        moneyMismatches.length === 0 &&
         supplierCodeMismatches.length === 0 &&
         ledger.balanced,
       counts: {
         paidNotDelivered: paidNotDelivered.length,
         deliveredNotPaid: deliveredNotPaid.length,
+        moneyMismatches: moneyMismatches.length,
         unmatchedEvents: unmatchedEvents.length,
         paidAfterFailure: paidAfterFailure.length,
         supplierKeysWithoutDelivery: supplierKeysWithoutDelivery.length,
@@ -107,6 +136,7 @@ export class ReconciliationService {
       ledger,
       paidNotDelivered,
       deliveredNotPaid,
+      moneyMismatches,
       unmatchedEvents,
       paidAfterFailure,
       supplierKeysWithoutDelivery,

@@ -95,13 +95,14 @@ export class CatalogService {
   async generate(count: number) {
     const inserted: unknown[] = await this.dataSource.query(
       `
-      INSERT INTO products (sku, name, type, price, currency, image, active)
+      INSERT INTO products (sku, name, type, price, currency, image, supplier, active)
       SELECT 'GEN-' || upper(t.type) || '-' || lpad(g::text, 7, '0'),
              initcap(t.type) || ' item #' || g,
              t.type,
              100 + (g * 37) % 5000,
              'RUB',
              'assets/' || t.type || '.png',
+             CASE WHEN g % 2 = 0 THEN 'a' ELSE 'b' END,
              true
       FROM generate_series(1, $1) AS g
       CROSS JOIN LATERAL (SELECT ($2::text[])[1 + g % 4] AS type) AS t

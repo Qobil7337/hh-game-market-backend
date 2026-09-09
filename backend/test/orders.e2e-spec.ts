@@ -42,8 +42,8 @@ describe('order lifecycle', () => {
     expect(webhook).toEqual({ status: 200, body: { result: 'applied' } });
 
     const delivered = await t.waitForStatus(order.id, 'delivered');
-    expect(delivered.delivery.supplier).toBe('a');
-    expect(delivered.delivery.code).toMatch(
+    expect(delivered.items[0].delivery.supplier).toBe('a');
+    expect(delivered.items[0].delivery.code).toMatch(
       /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/,
     );
   });
@@ -75,9 +75,9 @@ describe('order lifecycle', () => {
     expect((await t.api('POST', '/webhooks/payment', event)).body).toEqual({
       result: 'duplicate',
     });
-    expect((await t.api('GET', `/orders/${order.id}`)).body.delivery.code).toBe(
-      delivered.delivery.code,
-    );
+    expect(
+      (await t.api('GET', `/orders/${order.id}`)).body.items[0].delivery.code,
+    ).toBe(delivered.items[0].delivery.code);
   });
 
   it('ignores a second, distinct paid event for an order that already left created', async () => {

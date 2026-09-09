@@ -8,7 +8,7 @@ import {
 } from 'typeorm';
 
 export type LedgerAccount = 'cash' | 'customer_liability' | 'revenue';
-export type LedgerReason = 'payment' | 'delivery';
+export type LedgerReason = 'payment' | 'delivery' | 'refund';
 
 // Append-only double-entry journal. Every business event posts a balanced pair
 // of rows inside the same transaction that changes the order, so the whole
@@ -37,8 +37,8 @@ export class LedgerEntry {
   @Column({ type: 'varchar' })
   reason: LedgerReason;
 
-  // event_id for payments, order id for deliveries: posting the same fact twice
-  // violates the unique constraint instead of doubling the books.
+  // event_id for payments, item id for deliveries and refunds: posting the same
+  // fact twice violates the unique constraint instead of doubling the books.
   @Column()
   reference: string;
 

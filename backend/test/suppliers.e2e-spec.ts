@@ -72,7 +72,7 @@ describe('supplier timeouts, retries and fallback', () => {
     await setStub(t, 'a', { timeoutRate: 0 });
 
     const delivered = await t.waitForStatus(order.id, 'delivered');
-    expect(delivered.delivery).toMatchObject({
+    expect(delivered.items[0].delivery).toMatchObject({
       supplier: 'a',
       code: issued.code,
     });
@@ -105,7 +105,7 @@ describe('supplier timeouts, retries and fallback', () => {
     );
 
     const delivered = await t.waitForStatus(order.id, 'delivered');
-    expect(delivered.delivery).toMatchObject({
+    expect(delivered.items[0].delivery).toMatchObject({
       supplier: 'a',
       code: keys[0].code,
     });
@@ -119,7 +119,7 @@ describe('supplier timeouts, retries and fallback', () => {
     await pay(t, order);
 
     const delivered = await t.waitForStatus(order.id, 'delivered');
-    expect(delivered.delivery.supplier).toBe('b');
+    expect(delivered.items[0].delivery.supplier).toBe('b');
     expect(outcomes(delivered)).toEqual([
       'a:error',
       'a:error',
@@ -142,7 +142,7 @@ describe('supplier timeouts, retries and fallback', () => {
       await pay(t, order);
 
       const delivered = await t.waitForStatus(order.id, 'delivered');
-      expect(delivered.delivery.supplier).toBe('b');
+      expect(delivered.items[0].delivery.supplier).toBe('b');
       const aAttempts = delivered.attempts.filter(
         (a: any) => a.supplier === 'a',
       );
@@ -157,32 +157,33 @@ describe('supplier timeouts, retries and fallback', () => {
     await expectConsistent(t.app);
   });
 
-  it('no stock anywhere: the order parks as out_of_stock; restock + retry delivers it', async () => {
+  it('no stock anywhere: the order is refunded after one attempt per supplier', async () => {
     await t.app
       .get(DataSource)
       .query('DELETE FROM supplier_keys WHERE request_id IS NULL');
     const order = await t.createOrder();
     await pay(t, order);
 
-    const parked = await t.waitForStatus(order.id, 'out_of_stock');
+    const refunded = await t.waitForStatus(order.id, 'refunded');
     // Out of stock is definitive, so no retries: one attempt per supplier.
-    expect(outcomes(parked)).toEqual(['a:out_of_stock', 'b:out_of_stock']);
-    expect(parked.delivery).toBeNull();
+    expect(outcomes(refunded)).toEqual(['a:out_of_stock', 'b:out_of_stock']);
+    expect(refunded.items[0]).toMatchObject({
+      status: 'refunded',
+      delivery: null,
+      refund: { amount: 1990, reason: 'out_of_stock' },
+    });
+    expect(refunded.money).toEqual({
+      paid: 1990,
+      delivered: 0,
+      refunded: 1990,
+      pending: 0,
+    });
 
+    // A final order stays final: a restock does not reopen it.
     const restock = await t.api('POST', '/stubs/suppliers/b/keys', {
       codes: ['TEST-0000-0001'],
     });
     expect(restock.body).toEqual({ added: 1, available: 1 });
-    expect((await t.api('POST', `/orders/${order.id}/deliver`)).status).toBe(
-      200,
-    );
-
-    const delivered = await t.waitForStatus(order.id, 'delivered');
-    expect(delivered.delivery).toMatchObject({
-      supplier: 'b',
-      code: 'TEST-0000-0001',
-    });
-    // Retrying a delivered order is refused.
     expect((await t.api('POST', `/orders/${order.id}/deliver`)).status).toBe(
       409,
     );
@@ -197,9 +198,15 @@ describe('supplier timeouts, retries and fallback', () => {
     );
     await Promise.all(orders.map((order) => pay(t, order)));
 
+    // Definitive failures on both suppliers refund the order; that is rare at
+    // these rates but legitimate, so it is an accepted end state here.
     const settled = await Promise.all(
       orders.map((order) =>
-        t.waitForStatus(order.id, ['delivered', 'delivery_failed'], 30_000),
+        t.waitForStatus(
+          order.id,
+          ['delivered', 'refunded', 'delivery_failed'],
+          30_000,
+        ),
       ),
     );
     for (const order of settled) {
@@ -207,9 +214,9 @@ describe('supplier timeouts, retries and fallback', () => {
       expect(keys.length).toBeLessThanOrEqual(1);
       if (order.status === 'delivered') {
         expect(keys).toHaveLength(1);
-        expect(keys[0].code).toBe(order.delivery.code);
+        expect(keys[0].code).toBe(order.items[0].delivery.code);
       } else {
-        expect(order.delivery).toBeNull();
+        expect(order.items[0].delivery).toBeNull();
       }
     }
 
@@ -217,18 +224,25 @@ describe('supplier timeouts, retries and fallback', () => {
     // on one supplier must go back to that supplier and get the code it holds.
     await setStub(t, 'a', { errorRate: 0, timeoutRate: 0 });
     await setStub(t, 'b', { errorRate: 0, timeoutRate: 0 });
-    for (const order of settled.filter((o) => o.status !== 'delivered')) {
+    for (const order of settled.filter((o) => o.status === 'delivery_failed')) {
       expect((await t.api('POST', `/orders/${order.id}/deliver`)).status).toBe(
         200,
       );
     }
 
     const finals = await Promise.all(
-      orders.map((order) => t.waitForStatus(order.id, 'delivered', 30_000)),
+      orders.map((order) =>
+        t.waitForStatus(order.id, ['delivered', 'refunded'], 30_000),
+      ),
     );
-    expect(new Set(finals.map((f) => f.delivery.code)).size).toBe(15);
+    const delivered = finals.filter((f) => f.status === 'delivered');
+    expect(new Set(delivered.map((f) => f.items[0].delivery.code)).size).toBe(
+      delivered.length,
+    );
     for (const order of finals) {
-      expect(await issuedKeys(t.app, order.id)).toHaveLength(1);
+      expect(await issuedKeys(t.app, order.id)).toHaveLength(
+        order.status === 'delivered' ? 1 : 0,
+      );
     }
     await expectConsistent(t.app);
   });

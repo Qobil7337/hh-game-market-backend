@@ -19,6 +19,9 @@ export class DeliveryAttempt {
   @Column({ name: 'order_id', type: 'uuid' })
   orderId: string;
 
+  @Column({ name: 'order_item_id', type: 'uuid' })
+  orderItemId: string;
+
   @Column()
   supplier: string;
 

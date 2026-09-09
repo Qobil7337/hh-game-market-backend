@@ -55,6 +55,11 @@ class StubConfigDto {
   @IsInt()
   @Min(0)
   hangMs?: number;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  unavailableSkus?: string[];
 }
 
 class RestockDto {

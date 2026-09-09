@@ -55,7 +55,7 @@ describe('exactly-once under concurrent webhooks', () => {
 
     expect(tally(results)).toEqual({ applied: 1, duplicate: 49 });
     const delivered = await a.waitForStatus(order.id, 'delivered');
-    expect(delivered.delivery.code).toMatch(CODE);
+    expect(delivered.items[0].delivery.code).toMatch(CODE);
     await expectConsistent(a.app);
   });
 
@@ -93,9 +93,9 @@ describe('exactly-once under concurrent webhooks', () => {
       'payment_failed',
     ]);
     if (final.status === 'delivered') {
-      expect(final.delivery.code).toMatch(CODE);
+      expect(final.items[0].delivery.code).toMatch(CODE);
     } else {
-      expect(final.delivery).toBeNull();
+      expect(final.items[0].delivery).toBeNull();
     }
     await expectConsistent(a.app);
   });
@@ -112,7 +112,7 @@ describe('exactly-once under concurrent webhooks', () => {
     expect(lateFailure.body).toEqual({ result: 'ignored_delivered' });
     expect((await a.api('GET', `/orders/${first.id}`)).body).toMatchObject({
       status: 'delivered',
-      delivery: { code: delivered.delivery.code },
+      items: [{ delivery: { code: delivered.items[0].delivery.code } }],
     });
 
     const second = await a.createOrder();
@@ -129,7 +129,7 @@ describe('exactly-once under concurrent webhooks', () => {
     expect(latePayment.body).toEqual({ result: 'ignored_payment_failed' });
     expect((await a.api('GET', `/orders/${second.id}`)).body).toMatchObject({
       status: 'payment_failed',
-      delivery: null,
+      items: [{ delivery: null }],
     });
 
     await expectConsistent(a.app);
@@ -159,7 +159,7 @@ describe('exactly-once under concurrent webhooks', () => {
     const finals = await Promise.all(
       orders.map((order) => a.waitForStatus(order.id, 'delivered')),
     );
-    const codes = new Set(finals.map((final) => final.delivery.code));
+    const codes = new Set(finals.map((final) => final.items[0].delivery.code));
     expect(codes.size).toBe(20);
     await expectConsistent(a.app);
   });

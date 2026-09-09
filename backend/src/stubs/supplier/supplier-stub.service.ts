@@ -11,6 +11,8 @@ export interface StubConfig {
   // Probability (0..1) of hanging for hangMs *after* a key was issued and committed.
   timeoutRate: number;
   hangMs: number;
+  // SKUs this supplier answers out_of_stock for, whatever its pool holds.
+  unavailableSkus: string[];
 }
 
 export type StubIssueResult =
@@ -33,6 +35,7 @@ export class SupplierStubService {
         errorRate: Number(config.get(`${prefix}_ERROR_RATE`, 0)),
         timeoutRate: Number(config.get(`${prefix}_TIMEOUT_RATE`, 0)),
         hangMs: Number(config.get('STUB_HANG_MS', 10_000)),
+        unavailableSkus: [],
       });
     }
   }
@@ -46,7 +49,7 @@ export class SupplierStubService {
     // A validated DTO carries every declared field, absent ones as undefined, so a
     // plain spread would wipe the settings the caller did not mention.
     for (const [key, value] of Object.entries(patch)) {
-      if (value !== undefined) next[key as keyof StubConfig] = value;
+      if (value !== undefined) (next as Record<string, unknown>)[key] = value;
     }
     this.configs.set(supplier, next);
     return next;
@@ -82,11 +85,15 @@ export class SupplierStubService {
     orderId: string,
     sku: string,
   ): Promise<StubIssueResult> {
-    const { errorRate, timeoutRate, hangMs } = this.getConfig(supplier);
+    const { errorRate, timeoutRate, hangMs, unavailableSkus } =
+      this.getConfig(supplier);
 
     // A failure drawn here happens before anything is written: the definitive kind.
     if (Math.random() < errorRate) {
       return { status: 'error', reason: 'internal_error' };
+    }
+    if (unavailableSkus.includes(sku)) {
+      return { status: 'error', reason: 'out_of_stock' };
     }
 
     const result = await this.reserve(supplier, requestId, orderId, sku);
