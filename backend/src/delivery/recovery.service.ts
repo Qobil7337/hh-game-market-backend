@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
-import { Order, OrderStatus } from '../orders/order.entity.js';
+import { OrderStatus } from '../orders/order.entity.js';
 import { DeliveryWorker } from './delivery.worker.js';
 
 // Periodically puts stuck and parked orders back in the queue. Safe to run at
@@ -58,20 +58,26 @@ export class RecoveryService implements OnModuleInit, OnModuleDestroy {
     return { stale, parked };
   }
 
+  // One statement: move the orders and write their history rows together.
   private async requeue(
     from: OrderStatus[],
     olderThanMs: number,
   ): Promise<string[]> {
-    const result = await this.dataSource
-      .createQueryBuilder()
-      .update(Order)
-      .set({ status: OrderStatus.Paid })
-      .where('status IN (:...from) AND updated_at < :before', {
-        from,
-        before: new Date(Date.now() - olderThanMs),
-      })
-      .returning('id')
-      .execute();
-    return (result.raw as { id: string }[]).map((row) => row.id);
+    const rows: { order_id: string }[] = await this.dataSource.query(
+      `WITH moved AS (
+         UPDATE orders o SET status = 'paid', updated_at = now()
+         FROM (SELECT id, status FROM orders
+               WHERE status::text = ANY($1::text[]) AND updated_at < $2) s
+         WHERE o.id = s.id
+         RETURNING o.id, s.status AS previous
+       )
+       INSERT INTO order_events (order_id, type, data)
+       SELECT id, 'order.status',
+              jsonb_build_object('from', previous, 'to', 'paid', 'reason', 'recovery')
+       FROM moved
+       RETURNING order_id`,
+      [from, new Date(Date.now() - olderThanMs)],
+    );
+    return rows.map((row) => row.order_id);
   }
 }

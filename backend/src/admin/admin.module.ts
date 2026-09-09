@@ -1,13 +1,14 @@
 import { Module } from '@nestjs/common';
 import { CatalogModule } from '../catalog/catalog.module.js';
 import { DeliveryModule } from '../delivery/delivery.module.js';
+import { HistoryModule } from '../history/history.module.js';
 import { LedgerModule } from '../ledger/ledger.module.js';
 import { AdminController } from './admin.controller.js';
 import { ProgressService } from './progress.service.js';
 import { ReconciliationService } from './reconciliation.service.js';
 
 @Module({
-  imports: [DeliveryModule, LedgerModule, CatalogModule],
+  imports: [DeliveryModule, LedgerModule, CatalogModule, HistoryModule],
   controllers: [AdminController],
   providers: [ReconciliationService, ProgressService],
 })

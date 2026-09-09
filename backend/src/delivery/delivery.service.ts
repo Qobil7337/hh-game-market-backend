@@ -155,6 +155,7 @@ export class DeliveryService {
       ItemStatus.Pending,
       ItemStatus.Refunding,
       { refundReason: reason },
+      { amount: item.amount },
     );
     item.status = ItemStatus.Refunding;
     item.refundReason = reason;
@@ -536,6 +537,8 @@ export class DeliveryService {
         item.id,
         ItemStatus.Pending,
         ItemStatus.Delivered,
+        {},
+        { code, supplier, requestId, amount: item.amount },
       );
       await this.ledger.recordDelivery(em, item);
       await this.catalog.decrementStock(em, item.sku);
@@ -591,6 +594,8 @@ export class DeliveryService {
         item.id,
         ItemStatus.Refunding,
         ItemStatus.Refunded,
+        {},
+        { amount: item.amount, reason: item.refundReason },
       );
       await this.ledger.recordRefund(em, item);
     });

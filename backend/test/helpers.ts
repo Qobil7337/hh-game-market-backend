@@ -108,7 +108,7 @@ export async function resetDatabase(app: NestFastifyApplication) {
   await app
     .get(DataSource)
     .query(
-      'TRUNCATE TABLE orders, order_items, payment_events, deliveries, delivery_attempts, refunds, ledger_entries, supplier_discrepancies, supplier_calls, supplier_keys, supplier_issues, psp_refunds, products, product_stock RESTART IDENTITY CASCADE',
+      'TRUNCATE TABLE orders, order_items, payment_events, deliveries, delivery_attempts, refunds, ledger_entries, supplier_discrepancies, supplier_calls, supplier_keys, supplier_issues, order_events, psp_refunds, products, product_stock RESTART IDENTITY CASCADE',
     );
   await app.get(SeedService).seed();
 }

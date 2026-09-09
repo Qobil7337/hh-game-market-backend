@@ -8,11 +8,12 @@ import {
   Put,
   Query,
 } from '@nestjs/common';
-import { IsInt, Max, Min } from 'class-validator';
+import { IsInt, IsISO8601, IsOptional, Max, Min } from 'class-validator';
 import { CatalogService } from '../catalog/catalog.service.js';
 import { StorefrontQueryDto } from '../catalog/dto/storefront-query.dto.js';
 import { RecoveryService } from '../delivery/recovery.service.js';
 import { SupplierAuditService } from '../delivery/supplier-audit.service.js';
+import { HistoryService } from '../history/history.service.js';
 import { ProgressService } from './progress.service.js';
 import { ReconciliationService } from './reconciliation.service.js';
 
@@ -29,6 +30,21 @@ class GenerateCatalogDto {
   count: number;
 }
 
+// ?at= for a moment, ?from=&to= for a period [from, to); nothing = now.
+class MoneyQueryDto {
+  @IsOptional()
+  @IsISO8601()
+  at?: string;
+
+  @IsOptional()
+  @IsISO8601()
+  from?: string;
+
+  @IsOptional()
+  @IsISO8601()
+  to?: string;
+}
+
 // Operator tooling. No auth here on purpose: the assignment does not ask for it,
 // and it keeps every scenario reproducible with plain curl.
 @Controller('admin')
@@ -38,8 +54,22 @@ export class AdminController {
     private readonly recovery: RecoveryService,
     private readonly audit: SupplierAuditService,
     private readonly progress: ProgressService,
+    private readonly history: HistoryService,
     private readonly catalog: CatalogService,
   ) {}
+
+  // Money as it was at a moment, or what moved over a period, from the
+  // append-only ledger, cross-checked against the order events.
+  @Get('money')
+  money(@Query() query: MoneyQueryDto) {
+    if (query.from || query.to) {
+      return this.history.moneyBetween(
+        query.from ? new Date(query.from) : new Date(0),
+        query.to ? new Date(query.to) : new Date(),
+      );
+    }
+    return this.history.moneyAt(query.at ? new Date(query.at) : new Date());
+  }
 
   @Get('reconciliation')
   reconcile() {

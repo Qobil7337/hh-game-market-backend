@@ -108,9 +108,14 @@ export class PaymentsService {
       return 'amount_mismatch';
     }
 
-    await transitionOrder(em, order.id, OrderStatus.Created, OrderStatus.Paid, {
-      paidAt: new Date(),
-    });
+    await transitionOrder(
+      em,
+      order.id,
+      OrderStatus.Created,
+      OrderStatus.Paid,
+      { paidAt: new Date() },
+      { eventId: dto.event_id, amount: dto.amount, currency: dto.currency },
+    );
     await this.ledger.recordPayment(em, order, dto.event_id);
     return 'applied';
   }

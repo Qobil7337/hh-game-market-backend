@@ -13,6 +13,8 @@ import { Delivery } from '../delivery/delivery.entity.js';
 import { DeliveryWorker } from '../delivery/delivery.worker.js';
 import { Refund } from '../delivery/refund.entity.js';
 import { SupplierDiscrepancy } from '../delivery/supplier-discrepancy.entity.js';
+import { HistoryService } from '../history/history.service.js';
+import { OrderEvent } from '../history/order-event.entity.js';
 import { CreateOrderDto } from './dto/create-order.dto.js';
 import { ItemStatus, OrderItem } from './order-item.entity.js';
 import { transitionOrder } from './order-transition.js';
@@ -35,6 +37,7 @@ export class OrdersService {
     @InjectRepository(SupplierDiscrepancy)
     private readonly discrepancies: Repository<SupplierDiscrepancy>,
     private readonly worker: DeliveryWorker,
+    private readonly historyService: HistoryService,
   ) {}
 
   async create(dto: CreateOrderDto) {
@@ -69,7 +72,7 @@ export class OrdersService {
           currency,
         }),
       );
-      await em.insert(
+      const inserted = await em.insert(
         OrderItem,
         units.map((product, position) => ({
           orderId: order.id,
@@ -79,9 +82,47 @@ export class OrdersService {
           currency,
         })),
       );
+      // The first history row; item statuses are replayed on top of it.
+      await em.insert(OrderEvent, {
+        orderId: order.id,
+        orderItemId: null,
+        type: 'order.created',
+        data: {
+          amount: order.amount,
+          currency,
+          items: units.map((product, position) => ({
+            id: (inserted.identifiers[position] as { id: string }).id,
+            position,
+            sku: product.sku,
+            amount: product.price,
+          })),
+        },
+      });
       return order.id;
     });
     return this.get(id);
+  }
+
+  async history(id: string) {
+    await this.find(id);
+    return (await this.historyService.eventsOf(id)).map((e) => ({
+      id: e.id,
+      at: e.at,
+      type: e.type,
+      itemId: e.orderItemId,
+      data: e.data,
+    }));
+  }
+
+  async stateAt(id: string, at: Date) {
+    await this.find(id);
+    const state = await this.historyService.stateAt(id, at);
+    if (!state) {
+      throw new NotFoundException(
+        `Order ${id} did not exist yet at ${at.toISOString()}`,
+      );
+    }
+    return state;
   }
 
   async get(id: string) {
@@ -186,6 +227,8 @@ export class OrdersService {
         id,
         order.status,
         OrderStatus.Paid,
+        {},
+        { reason: 'operator' },
       );
     } catch {
       throw new ConflictException('Order changed status concurrently; retry');
