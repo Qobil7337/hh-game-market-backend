@@ -11,6 +11,8 @@ import { DeliveryWorker } from './delivery.worker.js';
 import { PspClient } from './psp.client.js';
 import { RecoveryService } from './recovery.service.js';
 import { Refund } from './refund.entity.js';
+import { SupplierAuditService } from './supplier-audit.service.js';
+import { SupplierDiscrepancy } from './supplier-discrepancy.entity.js';
 import { SupplierClient } from './supplier.client.js';
 
 @Module({
@@ -19,6 +21,7 @@ import { SupplierClient } from './supplier.client.js';
       Delivery,
       DeliveryAttempt,
       Refund,
+      SupplierDiscrepancy,
       Order,
       OrderItem,
     ]),
@@ -29,9 +32,15 @@ import { SupplierClient } from './supplier.client.js';
     DeliveryWorker,
     DeliveryService,
     RecoveryService,
+    SupplierAuditService,
     SupplierClient,
     PspClient,
   ],
-  exports: [DeliveryWorker, RecoveryService, TypeOrmModule],
+  exports: [
+    DeliveryWorker,
+    RecoveryService,
+    SupplierAuditService,
+    TypeOrmModule,
+  ],
 })
 export class DeliveryModule {}

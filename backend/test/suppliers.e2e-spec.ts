@@ -93,7 +93,12 @@ describe('supplier timeouts, retries and fallback', () => {
     await pay(t, order);
 
     const parked = await t.waitForStatus(order.id, 'delivery_failed');
-    expect(outcomes(parked)).toEqual(['a:timeout', 'a:timeout', 'a:timeout']);
+    expect(outcomes(parked)).toEqual([
+      'a:timeout',
+      'a:timeout',
+      'a:timeout',
+      'a:timeout', // the book lookup hangs too
+    ]);
     // A holds a code for this order; B was never asked.
     const keys = await issuedKeys(t.app, order.id);
     expect(keys).toHaveLength(1);
@@ -120,10 +125,12 @@ describe('supplier timeouts, retries and fallback', () => {
 
     const delivered = await t.waitForStatus(order.id, 'delivered');
     expect(delivered.items[0].delivery.supplier).toBe('b');
+    // Before leaving A its book is checked: a 5xx may have booked a code.
     expect(outcomes(delivered)).toEqual([
       'a:error',
       'a:error',
       'a:error',
+      'a:none_issued',
       'b:ok',
     ]);
     expect(delivered.attempts[0].detail).toBe('http_500 internal_error');
@@ -148,7 +155,7 @@ describe('supplier timeouts, retries and fallback', () => {
       );
       expect(aAttempts).toHaveLength(3);
       for (const attempt of aAttempts) {
-        expect(attempt.outcome).toBe('error');
+        expect(attempt.outcome).toBe('unreachable');
         expect(attempt.detail).toMatch(/ECONNREFUSED/);
       }
     } finally {

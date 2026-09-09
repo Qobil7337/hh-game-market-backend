@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DataSource } from 'typeorm';
+import { DataSource, EntityManager } from 'typeorm';
+import { SupplierIssue } from './supplier-issue.entity.js';
 import { SupplierKey } from './supplier-key.entity.js';
 
 export const SUPPLIERS = ['a', 'b'] as const;
@@ -8,11 +9,19 @@ export const SUPPLIERS = ['a', 'b'] as const;
 export interface StubConfig {
   // Probability (0..1) of answering 5xx *before* issuing anything.
   errorRate: number;
-  // Probability (0..1) of hanging for hangMs *after* a key was issued and committed.
+  // Probability (0..1) of hanging for hangMs *after* the work is done and
+  // committed. Applies to every endpoint, the statement lookup included.
   timeoutRate: number;
   hangMs: number;
   // SKUs this supplier answers out_of_stock for, whatever its pool holds.
   unavailableSkus: string[];
+  // Dishonest behaviour (0..1 each), see issue():
+  // books a code that was already issued to another request_id;
+  duplicateRate: number;
+  // books one code but answers with somebody else's;
+  foreignRate: number;
+  // books the code, then answers 5xx anyway.
+  errorAfterIssueRate: number;
 }
 
 export type StubIssueResult =
@@ -36,6 +45,9 @@ export class SupplierStubService {
         timeoutRate: Number(config.get(`${prefix}_TIMEOUT_RATE`, 0)),
         hangMs: Number(config.get('STUB_HANG_MS', 10_000)),
         unavailableSkus: [],
+        duplicateRate: 0,
+        foreignRate: 0,
+        errorAfterIssueRate: 0,
       });
     }
   }
@@ -59,7 +71,8 @@ export class SupplierStubService {
     const [stock] = await this.dataSource.query(
       `SELECT
          count(*) FILTER (WHERE request_id IS NULL)::int     AS available,
-         count(*) FILTER (WHERE request_id IS NOT NULL)::int AS issued
+         count(*) FILTER (WHERE request_id IS NOT NULL)::int AS issued,
+         (SELECT count(*) FROM supplier_issues WHERE supplier = $1)::int AS booked
        FROM supplier_keys WHERE supplier = $1`,
       [supplier],
     );
@@ -79,13 +92,30 @@ export class SupplierStubService {
     return { added: result.raw.length, available: stock.available };
   }
 
+  // The supplier's statement: one entry, or everything it has booked.
+  async issued(supplier: string, requestId?: string) {
+    const rows = await this.dataSource.getRepository(SupplierIssue).find({
+      where: requestId ? { supplier, requestId } : { supplier },
+      order: { issuedAt: 'ASC' },
+      take: 1000,
+    });
+    await this.maybeHang(supplier);
+    return rows.map((row) => ({
+      request_id: row.requestId,
+      code: row.code,
+      order_id: row.orderId,
+      sku: row.sku,
+      issued_at: row.issuedAt,
+    }));
+  }
+
   async issue(
     supplier: string,
     requestId: string,
     orderId: string,
     sku: string,
   ): Promise<StubIssueResult> {
-    const { errorRate, timeoutRate, hangMs, unavailableSkus } =
+    const { errorRate, unavailableSkus, foreignRate, errorAfterIssueRate } =
       this.getConfig(supplier);
 
     // A failure drawn here happens before anything is written: the definitive kind.
@@ -98,13 +128,24 @@ export class SupplierStubService {
 
     const result = await this.reserve(supplier, requestId, orderId, sku);
 
-    // The trap. The key above is already committed; from here the response merely
-    // takes longer than the caller is willing to wait, which from the outside looks
-    // exactly like a supplier that never issued anything.
+    // Everything below happens after the book has been written, so the answer
+    // no longer matches the book. This is the untrusted supplier of task 2.
+    if (result.status === 'ok' && Math.random() < foreignRate) {
+      result.code = await this.foreignCode(supplier);
+    }
+    if (result.status === 'ok' && Math.random() < errorAfterIssueRate) {
+      return { status: 'error', reason: 'internal_error' };
+    }
+    // The trap from stage 1: the key is committed, only the response is late.
+    await this.maybeHang(supplier);
+    return result;
+  }
+
+  private async maybeHang(supplier: string) {
+    const { timeoutRate, hangMs } = this.getConfig(supplier);
     if (Math.random() < timeoutRate) {
       await sleep(hangMs);
     }
-    return result;
   }
 
   private reserve(
@@ -118,33 +159,79 @@ export class SupplierStubService {
       // original call cannot reserve a second key.
       await em.query('SELECT pg_advisory_xact_lock(hashtext($1))', [requestId]);
 
-      const existing = await em.findOneBy(SupplierKey, { requestId });
+      // Same request_id, same code: the contract's idempotency, kept honestly.
+      const existing = await em.findOneBy(SupplierIssue, { requestId });
       if (existing) {
         return { status: 'ok', request_id: requestId, code: existing.code };
       }
 
-      // Reserve one free key of this supplier. SKIP LOCKED keeps concurrent issues
-      // for different request_ids from fighting over the same row.
-      const reserved = await em
-        .createQueryBuilder()
-        .update(SupplierKey)
-        .set({ requestId, orderId, sku, issuedAt: () => 'now()' })
-        .where(
-          `code = (
-            SELECT code FROM supplier_keys
-            WHERE supplier = :supplier AND request_id IS NULL
-            LIMIT 1 FOR UPDATE SKIP LOCKED
-          )`,
-          { supplier },
-        )
-        .returning('code')
-        .execute();
-
-      const code = (reserved.raw as { code: string }[])[0]?.code;
+      const code =
+        (await this.duplicateCode(em, supplier)) ??
+        (await this.reserveFreeKey(em, supplier, requestId, orderId, sku));
       if (!code) {
         return { status: 'error', reason: 'out_of_stock' };
       }
+      await em.insert(SupplierIssue, {
+        requestId,
+        supplier,
+        code,
+        orderId,
+        sku,
+      });
       return { status: 'ok', request_id: requestId, code };
     });
+  }
+
+  // Reserve one free key of this supplier. SKIP LOCKED keeps concurrent issues
+  // for different request_ids from fighting over the same row.
+  private async reserveFreeKey(
+    em: EntityManager,
+    supplier: string,
+    requestId: string,
+    orderId: string,
+    sku: string,
+  ): Promise<string | undefined> {
+    const reserved = await em
+      .createQueryBuilder()
+      .update(SupplierKey)
+      .set({ requestId, orderId, sku, issuedAt: () => 'now()' })
+      .where(
+        `code = (
+          SELECT code FROM supplier_keys
+          WHERE supplier = :supplier AND request_id IS NULL
+          LIMIT 1 FOR UPDATE SKIP LOCKED
+        )`,
+        { supplier },
+      )
+      .returning('code')
+      .execute();
+    return (reserved.raw as { code: string }[])[0]?.code;
+  }
+
+  // Dishonest: hands out a code this supplier already booked for somebody else.
+  private async duplicateCode(
+    em: EntityManager,
+    supplier: string,
+  ): Promise<string | undefined> {
+    if (Math.random() >= this.getConfig(supplier).duplicateRate) {
+      return undefined;
+    }
+    const [row] = (await em.query(
+      'SELECT code FROM supplier_issues WHERE supplier = $1 ORDER BY random() LIMIT 1',
+      [supplier],
+    )) as { code: string }[];
+    return row?.code;
+  }
+
+  // Dishonest: a code from another supplier's pool (or a made-up one).
+  private async foreignCode(supplier: string): Promise<string> {
+    const [row] = (await this.dataSource.query(
+      'SELECT code FROM supplier_keys WHERE supplier <> $1 AND request_id IS NULL ORDER BY random() LIMIT 1',
+      [supplier],
+    )) as { code: string }[];
+    return (
+      row?.code ??
+      `FAKE-${Math.random().toString(36).slice(2, 10).toUpperCase()}`
+    );
   }
 }

@@ -44,7 +44,7 @@ npm test
 > сконфигурированную базу** (`TRUNCATE`) и засевают её заново. Не запускайте
 > их против базы с нужными данными.
 
-35 e2e-тестов в `backend/test/`:
+40 e2e-тестов в `backend/test/`:
 
 | Файл | Что проверяет |
 | --- | --- |
@@ -54,13 +54,15 @@ npm test
 | `recovery.e2e-spec.ts` | этап 4: зависший `delivering`, повтор запаркованных заказов, сверка, журнал сходится |
 | `catalog.e2e-spec.ts` | этап 5: витрина с keyset-пагинацией, списание остатка, план запроса на 5 000 SKU идёт по индексу |
 | `multi-item.e2e-spec.ts` | **второе задание, задача 1**: три позиции от двух поставщиков; одна позиция не выдаётся → возврат, остальное у покупателя; ничего не выдаётся → полный возврат; воркер умер между позициями → recovery дожимает без второго кода; платёжка отвергла возврат → повтор платит ровно один раз; хаос на 12 заказов × 3 позиции — у каждого заказа оплачено = выдано + возвращено |
+| `untrusted.e2e-spec.ts` | **второе задание, задача 2**: поставщик прислал чужой (уже выданный) код → отклонён, три новых `request_id`, затем запасной поставщик; в ответе один код, в книге другой → выдан тот, что в книге; 5xx после выдачи → код взят из книги, второго запроса нет; аудит книги находит то, чего проход не видел, и ровно один раз; хаос с ложью, 5xx и зависаниями на обоих — каждый выданный код есть в книге, ни один не выдан дважды |
 
 Каждый тест заканчивается проверкой инвариантов прямо в базе
 (`expectConsistent` в `test/helpers.ts`): число выдач = число выданных позиций
-= число уникальных кодов = число ключей, списанных у поставщиков; число
-возвратов = число возвращённых позиций = число возвратов на стороне платёжки;
-для каждого оплаченного заказа оплачено = выдано + возвращено + ещё открыто, у
-финальных открытого нет; журнал сходится в ноль.
+= число уникальных кодов; каждый выданный код записан в книге поставщика под
+нашим `request_id`, а каждая запись книги без выдачи объяснена расхождением;
+число возвратов = число возвращённых позиций = число возвратов на стороне
+платёжки; для каждого оплаченного заказа оплачено = выдано + возвращено + ещё
+открыто, у финальных открытого нет; журнал сходится в ноль.
 
 ## Как воспроизвести проверки
 
@@ -91,8 +93,8 @@ npm run stub -- a --error-rate 1          # A всегда отвечает 5xx
 npm run pay                               # → 3 попытки к A, выдача от B
 
 npm run stub -- a --reset --timeout-rate 1 --hang-ms 8000
-npm run pay                               # A выдал код и завис → delivery_failed, B не трогаем
-curl http://localhost:3000/api/orders/<id>          # attempts: a:timeout ×3, delivery = null
+npm run pay                               # A выдал код и завис (и книга A тоже висит) → delivery_failed, B не трогаем
+curl http://localhost:3000/api/orders/<id>          # attempts: a:timeout ×4, delivery = null
 
 npm run stub -- a --reset
 curl -X POST http://localhost:3000/api/orders/<id>/deliver
@@ -124,6 +126,7 @@ curl -X POST http://localhost:3000/api/admin/recovery # прогнать вос�
 
 Логи — по строке JSON на событие (`LOG_FORMAT=json`): `payment.webhook`,
 `delivery.attempt`, `delivery.item_delivered`, `delivery.item_unresolved`,
+`delivery.verify_failed`, `supplier.discrepancy`, `supplier.audit`,
 `refund.completed`, `refund.failed`, `delivery.completed`, `delivery.parked`,
 `recovery.sweep`.
 
@@ -205,6 +208,57 @@ curl http://localhost:3000/api/admin/reconciliation
 Тот же инвариант для каждого заказа — в `money` из `GET /orders/:id`, и им же
 заканчивается каждый e2e-тест (`expectConsistent`).
 
+### Задача 2. Поставщик, которому нельзя доверять
+
+Ответ поставщика — заявление, а не факт. Факты два: **книга поставщика**
+(`GET /stubs/suppliers/{a|b}/issued?request_id=…` — что он записал под нашим
+`request_id`; за это он и выставит счёт) и **наша таблица выдач** (`code UNIQUE`
+— код выдаётся один раз). Код уходит покупателю только когда оба согласны;
+каждое несогласие пишется в `supplier_discrepancies` вместе с тем, что с ним
+сделали. Заглушка умеет врать тремя способами:
+
+```bash
+npm run stub -- a --reset --duplicate-rate 1         # A выдаёт уже выданные коды
+npm run pay                                          # → 3 раунда с новыми request_id отклонены, выдал B
+curl http://localhost:3000/api/orders/<id>           # attempts: a:ok, a:rejected ×3 …, b:ok; discrepancies: duplicate_code ×3
+
+npm run stub -- a --reset --foreign-rate 1           # A записывает один код, отвечает другим
+npm run pay                                          # → выдан код из книги; discrepancies: code_mismatch
+
+npm run stub -- a --reset --error-after-issue-rate 1 # A записывает код и отвечает 5xx
+npm run pay                                          # → 3 × a:error, код взят из книги, B не трогаем; discrepancies: error_but_issued
+
+npm run stub -- a --reset --error-rate 1             # честный 5xx до выдачи
+npm run pay                                          # → 3 × a:error, a:none_issued (книга пуста), b:ok
+```
+
+Что гарантирует каждое требование:
+
+- **один код не попадёт в два заказа** — `deliveries.code UNIQUE`; при
+  конфликте код отклоняется (`a:rejected`, `duplicate_code`), поставщика
+  спрашивают заново под новым `request_id` (`<item>:<supplier>:2`, `:3`), после
+  `SUPPLIER_MAX_ROUNDS` — запасной поставщик;
+- **покупатель получает ровно один рабочий код** — перед выдачей ответ
+  сверяется с книгой: расходится — выдаётся записанный (`code_mismatch`),
+  в книге пусто — отклоняется (`unbooked_code`); и `order_item_id UNIQUE`;
+- **ошибка, но код выдан → повтор не выдаёт второй** — после 5xx/таймаута,
+  прежде чем уйти к другому поставщику или вернуть деньги, читается книга: есть
+  код — берём его (`error_but_issued`), пусто после 5xx — `none_issued` и
+  дальше, пусто сразу после таймаута — заказ паркуется (запрос мог ещё
+  выполняться) и книга перечитывается на следующем проходе, недоступна —
+  заказ паркуется до повтора;
+- **расхождения находятся и разбираются сами** — всё выше происходит в момент
+  выдачи; остальное (запись в книге под `request_id`, который мы не посылали
+  или уже закрыли; код в книге поменялся после выдачи) находит аудит книги:
+  `POST /admin/supplier-audit` или раз в `SUPPLIER_AUDIT_INTERVAL_MS`. Каждое
+  расхождение записывается один раз с `resolution` — что сделано (код не
+  использован, спор с поставщиком). Ручного шага нет.
+
+```bash
+curl -X POST http://localhost:3000/api/admin/supplier-audit   # {"checked":{"a":12,"b":3},"unreachable":[],"found":[…]}
+curl http://localhost:3000/api/admin/reconciliation           # supplierDiscrepancies, supplierIssuesWithoutDelivery, supplierCodeMismatches
+```
+
 ## API
 
 Префикс `/api`. Тела — JSON.
@@ -214,18 +268,20 @@ curl http://localhost:3000/api/admin/reconciliation
 | `GET /health` | приложение и база |
 | `GET /products?type=&limit=&cursor=` | витрина: активные товары с остатком, keyset-пагинация по `sku` |
 | `POST /orders` `{items: [{sku, quantity?}]}` или `{sku}` | создать заказ (цены фиксируются из каталога, одна позиция на единицу) → `201` |
-| `GET /orders/:id` | заказ, позиции (`items[].delivery` / `items[].refund`), деньги (`money`) и история обращений к поставщикам (`attempts`) |
+| `GET /orders/:id` | заказ, позиции (`items[].delivery` / `items[].refund`), деньги (`money`), история обращений к поставщикам (`attempts`) и расхождения с ними (`discrepancies`) |
 | `POST /orders/:id/deliver` | повторная выдача для `delivery_failed` |
 | `POST /webhooks/payment` | вебхук платёжки по контракту; всегда `200` после записи события |
 | `POST /stubs/suppliers/{a\|b}/issue` | заглушка поставщика по контракту |
+| `GET /stubs/suppliers/{a\|b}/issued?request_id=` | книга поставщика: запись под `request_id` (404, если нет) или вся выписка |
 | `GET /stubs/suppliers/{a\|b}` | конфиг сбоев и остаток пула |
-| `PUT /stubs/suppliers/{a\|b}/config` `{errorRate, timeoutRate, hangMs, unavailableSkus}` | доля 5xx / зависаний (0..1), SKU «нет в наличии» |
+| `PUT /stubs/suppliers/{a\|b}/config` `{errorRate, timeoutRate, hangMs, unavailableSkus, duplicateRate, foreignRate, errorAfterIssueRate}` | доля 5xx / зависаний / лжи (0..1), SKU «нет в наличии» |
 | `POST /stubs/suppliers/{a\|b}/keys` `{codes[]}` | пополнить пул |
 | `POST /stubs/payments/refund` `{refund_id, order_id, amount, currency}` | заглушка платёжки: возврат, идемпотентный по `refund_id` |
 | `GET /stubs/payments` | конфиг и сколько возвратов получила платёжка |
 | `PUT /stubs/payments/config` `{errorRate}` | доля 5xx на возврат |
-| `GET /admin/reconciliation` | сверка + балансы журнала |
+| `GET /admin/reconciliation` | сверка + балансы журнала + расхождения с поставщиками |
 | `POST /admin/recovery` | прогнать восстановление сейчас |
+| `POST /admin/supplier-audit` | сверить книги поставщиков с выдачами сейчас |
 | `PUT /admin/stock/:sku` `{available}` | выставить остаток на витрине |
 | `POST /admin/catalog/generate` `{count}` | сгенерировать SKU для нагрузочных экспериментов |
 | `GET /admin/explain?…` | план витринного запроса |
@@ -260,6 +316,8 @@ created ──paid──▶ paid ──▶ delivering ──▶ delivered       
 | `SUPPLIER_TIMEOUT_MS` | `3000` | таймаут одного запроса |
 | `SUPPLIER_MAX_ATTEMPTS` | `3` | попыток на поставщика |
 | `SUPPLIER_RETRY_BASE_MS` | `500` | база экспоненциального бэкоффа (500, 1000, …) |
+| `SUPPLIER_MAX_ROUNDS` | `3` | новых `request_id` на поставщика после отклонённого кода |
+| `SUPPLIER_AUDIT_INTERVAL_MS` | `60000` | период сверки книг поставщиков с выдачами |
 | `DELIVERY_CONCURRENCY` | `4` | параллельных выдач в одном экземпляре |
 | `DELIVERY_POLL_INTERVAL_MS` | `2000` | страховочный опрос очереди |
 | `PSP_URL` `PSP_TIMEOUT_MS` | `http://localhost:3000/api/stubs/payments` `3000` | заглушка платёжки для возвратов |
@@ -274,11 +332,11 @@ created ──paid──▶ paid ──▶ delivering ──▶ delivered       
 backend/src/
 ├── orders/      Order, OrderItem + статусы, transitionOrder()/transitionItem() (compare-and-set), POST/GET /orders
 ├── payments/    PaymentEvent (event_id — PK), обработчик вебхука
-├── delivery/    Delivery, Refund, DeliveryAttempt, воркер (SKIP LOCKED), политика поставщиков, возвраты, recovery
+├── delivery/    Delivery, Refund, DeliveryAttempt, SupplierDiscrepancy, воркер (SKIP LOCKED), политика поставщиков, возвраты, recovery, аудит книг
 ├── ledger/      двойная запись: cash / customer_liability / revenue (оплата, выдача, возврат)
 ├── catalog/     Product (+ supplier), ProductStock, витрина
 ├── admin/       сверка, recovery, генератор каталога, EXPLAIN
-├── stubs/       заглушки: поставщики с инъекцией сбоев, платёжка (возвраты)
+├── stubs/       заглушки: поставщики с инъекцией сбоев и лжи (+ их книга), платёжка (возвраты)
 └── seed/        каталог и пул ключей из приложения к заданию
 backend/test/    e2e-тесты (vitest)
 backend/scripts/ pay.mjs — эмулятор вебхуков платёжки, stub.mjs — управление заглушками (a, b, psp)

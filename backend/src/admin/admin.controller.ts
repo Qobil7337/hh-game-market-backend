@@ -12,6 +12,7 @@ import { IsInt, Max, Min } from 'class-validator';
 import { CatalogService } from '../catalog/catalog.service.js';
 import { StorefrontQueryDto } from '../catalog/dto/storefront-query.dto.js';
 import { RecoveryService } from '../delivery/recovery.service.js';
+import { SupplierAuditService } from '../delivery/supplier-audit.service.js';
 import { ReconciliationService } from './reconciliation.service.js';
 
 class SetStockDto {
@@ -34,6 +35,7 @@ export class AdminController {
   constructor(
     private readonly reconciliation: ReconciliationService,
     private readonly recovery: RecoveryService,
+    private readonly audit: SupplierAuditService,
     private readonly catalog: CatalogService,
   ) {}
 
@@ -47,6 +49,14 @@ export class AdminController {
   @HttpCode(200)
   recover() {
     return this.recovery.sweep();
+  }
+
+  // Compares every supplier's book with our deliveries now instead of waiting
+  // for the next interval.
+  @Post('supplier-audit')
+  @HttpCode(200)
+  auditSuppliers() {
+    return this.audit.audit();
   }
 
   @Put('stock/:sku')

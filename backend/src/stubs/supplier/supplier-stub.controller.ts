@@ -9,6 +9,7 @@ import {
   Param,
   Post,
   Put,
+  Query,
 } from '@nestjs/common';
 import {
   ArrayNotEmpty,
@@ -60,6 +61,24 @@ class StubConfigDto {
   @IsArray()
   @IsString({ each: true })
   unavailableSkus?: string[];
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(1)
+  duplicateRate?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(1)
+  foreignRate?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(1)
+  errorAfterIssueRate?: number;
 }
 
 class RestockDto {
@@ -97,6 +116,23 @@ export class SupplierStubController {
         : new InternalServerErrorException(result);
     }
     return result;
+  }
+
+  // The statement: what the supplier has booked. With ?request_id= — one
+  // entry (404 if nothing was booked under it); without — everything.
+  @Get('issued')
+  async issued(
+    @Param('supplier') supplier: string,
+    @Query('request_id') requestId?: string,
+  ) {
+    const rows = await this.stub.issued(known(supplier), requestId);
+    if (requestId) {
+      if (rows.length === 0) {
+        throw new NotFoundException({ status: 'error', reason: 'not_found' });
+      }
+      return rows[0];
+    }
+    return { issued: rows };
   }
 
   // Everything below is test tooling, not part of the contract.

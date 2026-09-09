@@ -6,10 +6,19 @@ import {
   PrimaryGeneratedColumn,
 } from 'typeorm';
 
-export type AttemptOutcome = 'ok' | 'timeout' | 'error' | 'out_of_stock';
+export type AttemptOutcome =
+  | 'ok'
+  | 'timeout'
+  | 'error'
+  | 'unreachable'
+  | 'out_of_stock'
+  // Statement lookup after errors/timeouts: the book holds nothing for us.
+  | 'none_issued'
+  // Our verification rejected the code (duplicate, unbooked); a new round follows.
+  | 'rejected';
 
 // One row per call to a supplier. This is the evidence trail for "which supplier
-// may still hold a code for this order" and for the reconciliation stage.
+// may still hold a code for this item" and for the reconciliation stage.
 @Entity('delivery_attempts')
 export class DeliveryAttempt {
   @PrimaryGeneratedColumn()

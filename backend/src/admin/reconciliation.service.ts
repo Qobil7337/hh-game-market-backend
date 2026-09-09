@@ -22,8 +22,9 @@ export class ReconciliationService {
       moneyMismatches,
       unmatchedEvents,
       paidAfterFailure,
-      supplierKeysWithoutDelivery,
+      supplierIssuesWithoutDelivery,
       supplierCodeMismatches,
+      supplierDiscrepancies,
       ledger,
     ] = await Promise.all([
       // Money in, not every item settled yet. Expected to be transient; anything
@@ -92,26 +93,39 @@ export class ReconciliationService {
         ORDER BY received_at DESC
         LIMIT ${LIMIT}
       `),
-      // Keys a supplier holds for a request we have no delivery for: the trace
-      // an ambiguous timeout leaves behind until recovery resolves it.
+      // Entries in a supplier's book we have no delivery for and no recorded
+      // discrepancy about: the trace an ambiguous timeout leaves behind until
+      // the retry collects the code, or something the audit has not seen yet.
       q(`
         SELECT k.supplier, k.request_id AS "requestId", k.order_id AS "orderId",
                o.status, k.issued_at AS "issuedAt"
-        FROM supplier_keys k
+        FROM supplier_issues k
         LEFT JOIN orders o ON o.id::text = k.order_id
         LEFT JOIN deliveries d ON d.request_id = k.request_id
-        WHERE k.request_id IS NOT NULL AND d.id IS NULL
+        WHERE d.id IS NULL AND NOT EXISTS (
+          SELECT 1 FROM supplier_discrepancies x
+          WHERE x.supplier = k.supplier AND x.request_id = k.request_id)
         ORDER BY k.issued_at
         LIMIT ${LIMIT}
       `),
-      // Must be empty: a supplier issued a code for a request that was delivered
-      // with a different one, i.e. a second key was consumed.
+      // Must be empty: a delivered code differs from what the supplier booked
+      // under that request_id (we only ever deliver the booked code).
       q(`
         SELECT k.supplier, k.request_id AS "requestId", k.order_id AS "orderId",
-               d.supplier AS "deliveredBy"
-        FROM supplier_keys k
+               k.code AS "bookedCode", d.code AS "deliveredCode"
+        FROM supplier_issues k
         JOIN deliveries d ON d.request_id = k.request_id
         WHERE d.code <> k.code
+        LIMIT ${LIMIT}
+      `),
+      // Everything the supplier got wrong and what was done about it. Not a
+      // health problem by itself: each row is already resolved.
+      q(`
+        SELECT supplier, request_id AS "requestId", order_item_id AS "itemId", kind,
+               supplier_code AS "supplierCode", our_code AS "ourCode", resolution,
+               created_at AS "createdAt"
+        FROM supplier_discrepancies
+        ORDER BY created_at DESC
         LIMIT ${LIMIT}
       `),
       this.ledger.balances(),
@@ -130,8 +144,9 @@ export class ReconciliationService {
         moneyMismatches: moneyMismatches.length,
         unmatchedEvents: unmatchedEvents.length,
         paidAfterFailure: paidAfterFailure.length,
-        supplierKeysWithoutDelivery: supplierKeysWithoutDelivery.length,
+        supplierIssuesWithoutDelivery: supplierIssuesWithoutDelivery.length,
         supplierCodeMismatches: supplierCodeMismatches.length,
+        supplierDiscrepancies: supplierDiscrepancies.length,
       },
       ledger,
       paidNotDelivered,
@@ -139,8 +154,9 @@ export class ReconciliationService {
       moneyMismatches,
       unmatchedEvents,
       paidAfterFailure,
-      supplierKeysWithoutDelivery,
+      supplierIssuesWithoutDelivery,
       supplierCodeMismatches,
+      supplierDiscrepancies,
     };
   }
 }

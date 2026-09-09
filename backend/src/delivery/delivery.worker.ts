@@ -17,8 +17,9 @@ import { DeliveryService } from './delivery.service.js';
 export class DeliveryWorker implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DeliveryWorker.name);
   private timer?: NodeJS.Timeout;
-  private running = false;
+  private current?: Promise<void>;
   private wakeRequested = false;
+  private stopping = false;
 
   constructor(
     private readonly dataSource: DataSource,
@@ -30,11 +31,16 @@ export class DeliveryWorker implements OnModuleInit, OnModuleDestroy {
     const intervalMs = Number(
       this.config.get('DELIVERY_POLL_INTERVAL_MS', 2000),
     );
-    this.timer = setInterval(() => void this.run(), intervalMs);
+    this.timer = setInterval(() => this.wake(), intervalMs);
   }
 
-  onModuleDestroy() {
+  // Stop claiming and let the lanes finish the order they hold, while the
+  // HTTP server and the database are still up. An order interrupted anyway
+  // is left in `delivering` for the recovery sweep.
+  async onModuleDestroy() {
     clearInterval(this.timer);
+    this.stopping = true;
+    await this.current;
   }
 
   // Called right after a payment is applied so delivery starts without waiting for
@@ -45,20 +51,22 @@ export class DeliveryWorker implements OnModuleInit, OnModuleDestroy {
 
   // Only one drain runs at a time; wake() calls that arrive meanwhile fold into one
   // extra pass instead of starting a second one.
-  private async run() {
-    if (this.running) {
+  private run(): Promise<void> {
+    if (this.current) {
       this.wakeRequested = true;
-      return;
+      return this.current;
     }
-    this.running = true;
-    try {
-      do {
-        this.wakeRequested = false;
-        await this.drain();
-      } while (this.wakeRequested);
-    } finally {
-      this.running = false;
-    }
+    this.current = (async () => {
+      try {
+        do {
+          this.wakeRequested = false;
+          await this.drain();
+        } while (this.wakeRequested && !this.stopping);
+      } finally {
+        this.current = undefined;
+      }
+    })();
+    return this.current;
   }
 
   // A few lanes in parallel so one supplier stuck in retries does not hold up
@@ -69,7 +77,7 @@ export class DeliveryWorker implements OnModuleInit, OnModuleDestroy {
   }
 
   private async lane() {
-    for (;;) {
+    while (!this.stopping) {
       const order = await this.claim();
       if (!order) return;
       try {

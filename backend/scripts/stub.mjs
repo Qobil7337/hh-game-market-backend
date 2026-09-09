@@ -6,6 +6,9 @@
 //   node scripts/stub.mjs a --timeout-rate 1         A issues a code, then hangs
 //   node scripts/stub.mjs a --error-rate 0.5 --timeout-rate 0.3 --hang-ms 8000
 //   node scripts/stub.mjs a --unavailable KEY-EFT    A answers out_of_stock for KEY-EFT
+//   node scripts/stub.mjs a --duplicate-rate 1       A hands out codes it already issued
+//   node scripts/stub.mjs a --foreign-rate 1         A books one code, answers with another
+//   node scripts/stub.mjs a --error-after-issue-rate 1   A books the code, then answers 5xx
 //   node scripts/stub.mjs a --reset                  back to healthy
 //   node scripts/stub.mjs b --restock KEY-1,KEY-2    add keys to B's pool
 //   node scripts/stub.mjs psp --error-rate 1         payment provider rejects refunds
@@ -19,6 +22,9 @@ const { values: opts, positionals } = parseArgs({
     'timeout-rate': { type: 'string' },
     'hang-ms': { type: 'string' },
     unavailable: { type: 'string' },
+    'duplicate-rate': { type: 'string' },
+    'foreign-rate': { type: 'string' },
+    'error-after-issue-rate': { type: 'string' },
     reset: { type: 'boolean', default: false },
     restock: { type: 'string' },
   },
@@ -48,8 +54,22 @@ if (opts.reset) {
     patch,
     supplier === 'psp'
       ? { errorRate: 0 }
-      : { errorRate: 0, timeoutRate: 0, unavailableSkus: [] },
+      : {
+          errorRate: 0,
+          timeoutRate: 0,
+          unavailableSkus: [],
+          duplicateRate: 0,
+          foreignRate: 0,
+          errorAfterIssueRate: 0,
+        },
   );
+}
+for (const [flag, key] of [
+  ['duplicate-rate', 'duplicateRate'],
+  ['foreign-rate', 'foreignRate'],
+  ['error-after-issue-rate', 'errorAfterIssueRate'],
+]) {
+  if (opts[flag] !== undefined) patch[key] = Number(opts[flag]);
 }
 if (opts['error-rate'] !== undefined) {
   patch.errorRate = Number(opts['error-rate']);

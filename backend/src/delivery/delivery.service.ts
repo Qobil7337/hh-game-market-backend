@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DataSource } from 'typeorm';
+import { DataSource, QueryFailedError } from 'typeorm';
 import { CatalogService } from '../catalog/catalog.service.js';
 import { Product } from '../catalog/product.entity.js';
 import { LedgerService } from '../ledger/ledger.service.js';
@@ -11,29 +11,42 @@ import {
 } from '../orders/order-item.entity.js';
 import { transitionItem, transitionOrder } from '../orders/order-transition.js';
 import { Order, OrderStatus } from '../orders/order.entity.js';
-import { DeliveryAttempt } from './delivery-attempt.entity.js';
+import { AttemptOutcome, DeliveryAttempt } from './delivery-attempt.entity.js';
 import { Delivery } from './delivery.entity.js';
 import { PspClient } from './psp.client.js';
 import { Refund } from './refund.entity.js';
+import {
+  DiscrepancyKind,
+  SupplierDiscrepancy,
+} from './supplier-discrepancy.entity.js';
 import { SupplierClient } from './supplier.client.js';
 
-type SupplierOutcome =
-  | { kind: 'ok'; requestId: string; code: string }
+type IssueOutcome =
+  // The supplier answered with a code (or its book showed one after a
+  // non-answer). Not yet trusted: `verified` says whether it came from the book.
+  | { kind: 'issued'; code: string; verified: boolean }
   // Definitive: the supplier told us nothing was issued.
   | { kind: 'out_of_stock' }
-  // Definitive: only 5xx / network errors, all of which happen before a code exists.
+  // Definitive: nothing is booked for us (never reached it, or the book is empty).
   | { kind: 'failed' }
-  // At least one timeout with no answer since: the supplier may hold a code for us.
+  // Could not find out: answers and the book lookup both failed.
+  | { kind: 'ambiguous' };
+
+type SupplierOutcome =
+  | { kind: 'delivered' }
+  | { kind: 'out_of_stock' }
+  | { kind: 'failed' }
   | { kind: 'ambiguous' };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Runs the supplier chain for every item of one order. Timeouts are the whole
-// difficulty here: a request that timed out may still have issued a code on the
-// supplier side, so after a timeout the only safe move is to ask the *same*
-// supplier again with the *same* request_id until it gives a definite answer.
-// Falling back to another supplier — or refunding — at that point is how a
-// customer ends up with two codes, or with a code and their money.
+// Runs the supplier chain for every item of one order. The supplier's answer
+// is treated as a claim, not a fact: a timeout or a 5xx may still have booked
+// a code, an "ok" may carry a code that was already handed to somebody else or
+// one the supplier never booked. Two things settle every claim — the
+// supplier's own book (GET /issued, what it will bill for) and our deliveries
+// table (a code can be delivered once). Nothing reaches a customer before both
+// agree, and every disagreement is written down as a discrepancy.
 @Injectable()
 export class DeliveryService {
   private readonly logger = new Logger(DeliveryService.name);
@@ -76,8 +89,7 @@ export class DeliveryService {
       const outcome = await this.trySupplier(order, item, supplier, ambiguous);
       outcomes.push(outcome);
 
-      if (outcome.kind === 'ok') {
-        await this.complete(item, supplier, outcome.requestId, outcome.code);
+      if (outcome.kind === 'delivered') {
         return;
       }
       if (outcome.kind === 'ambiguous') {
@@ -88,7 +100,7 @@ export class DeliveryService {
           orderId: order.id,
           itemId: item.id,
           supplier,
-          reason: `${supplier} timed out and has not answered since; must not fall back`,
+          reason: `${supplier} gave no definite answer and its book is unreachable; must not fall back`,
         });
         return;
       }
@@ -116,9 +128,9 @@ export class DeliveryService {
   }
 
   // Suppliers in the order they should be tried: the one that stocks the SKU
-  // first, the others as fallbacks. Any supplier that timed out for this item
-  // earlier and never gave a definite answer jumps the queue and is flagged, so
-  // a retry resolves the open question before touching anyone else.
+  // first, the others as fallbacks. Any supplier whose last word for this item
+  // was a timeout or an error (it may have booked a code) jumps the queue and
+  // is flagged, so a retry resolves the open question before touching anyone else.
   private async supplierChain(
     item: OrderItem,
   ): Promise<{ supplier: string; ambiguous: boolean }[]> {
@@ -138,8 +150,10 @@ export class DeliveryService {
 
     const open = new Set<string>();
     for (const { supplier, outcome } of attempts) {
-      if (outcome === 'timeout') open.add(supplier);
-      if (outcome === 'ok' || outcome === 'out_of_stock') open.delete(supplier);
+      if (outcome === 'timeout' || outcome === 'error') open.add(supplier);
+      if (['ok', 'out_of_stock', 'none_issued', 'rejected'].includes(outcome)) {
+        open.delete(supplier);
+      }
     }
 
     return [
@@ -150,20 +164,71 @@ export class DeliveryService {
     ];
   }
 
+  // One supplier, up to SUPPLIER_MAX_ROUNDS request_ids. A round ends with a
+  // delivery, a definitive "no", or a code we had to reject (already delivered
+  // to someone else, or not in the supplier's book); after a rejection the next
+  // round presents a fresh request_id, because the same id would only bring
+  // the same bad code back.
   private async trySupplier(
     order: Order,
     item: OrderItem,
     supplier: string,
     previouslyAmbiguous: boolean,
   ): Promise<SupplierOutcome> {
+    const maxRounds = Number(this.config.get('SUPPLIER_MAX_ROUNDS', 3));
+    const firstRound = 1 + (await this.rejectedRounds(item, supplier));
+
+    for (let round = firstRound; round <= maxRounds; round++) {
+      // Stable per item, supplier and round, never per attempt: a retry after a
+      // timeout must present the same id so the supplier hands back the same code.
+      const requestId =
+        round === 1
+          ? `${item.id}:${supplier}`
+          : `${item.id}:${supplier}:${round}`;
+      const issued = await this.issue(
+        order,
+        item,
+        supplier,
+        requestId,
+        previouslyAmbiguous,
+      );
+      if (issued.kind !== 'issued') {
+        return issued;
+      }
+      const accepted = await this.accept(item, supplier, requestId, issued);
+      if (accepted !== 'rejected') {
+        return { kind: accepted };
+      }
+    }
+    // Rounds exhausted: this supplier keeps handing out codes we cannot use.
+    return { kind: 'failed' };
+  }
+
+  private async rejectedRounds(item: OrderItem, supplier: string) {
+    return this.dataSource.getRepository(SupplierDiscrepancy).countBy([
+      { orderItemId: item.id, supplier, kind: 'duplicate_code' },
+      { orderItemId: item.id, supplier, kind: 'unbooked_code' },
+    ]);
+  }
+
+  // The attempt loop for one request_id, then — if the answers were not
+  // definitive — the supplier's book, which is the only thing that can tell
+  // whether a timeout or a 5xx booked a code.
+  private async issue(
+    order: Order,
+    item: OrderItem,
+    supplier: string,
+    requestId: string,
+    previouslyAmbiguous: boolean,
+  ): Promise<IssueOutcome> {
     const maxAttempts = Number(this.config.get('SUPPLIER_MAX_ATTEMPTS', 3));
     const baseDelayMs = Number(this.config.get('SUPPLIER_RETRY_BASE_MS', 500));
-    // Stable per item and supplier, never per attempt: a retry after a timeout must
-    // present the same id so the supplier hands back the same code instead of a new one.
-    const requestId = `${item.id}:${supplier}`;
-    let ambiguous = previouslyAmbiguous;
+    let unknown = previouslyAmbiguous;
+    let sawError = false;
+    let sawTimeout = false;
+    let attempt = 0;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (attempt = 1; attempt <= maxAttempts; attempt++) {
       const startedAt = Date.now();
       const result = await this.client.issue(
         supplier,
@@ -171,50 +236,215 @@ export class DeliveryService {
         order.id,
         item.sku,
       );
-      const outcome = result.ok ? 'ok' : result.reason;
-      const detail = result.ok ? null : result.detail;
-      const latencyMs = Date.now() - startedAt;
-
-      await this.dataSource.getRepository(DeliveryAttempt).insert({
-        orderId: order.id,
-        orderItemId: item.id,
-        supplier,
-        requestId,
-        attempt,
-        outcome,
-        detail,
-        latencyMs,
-      });
-      this.logger.log({
-        event: 'delivery.attempt',
-        orderId: order.id,
-        itemId: item.id,
-        sku: item.sku,
-        supplier,
-        requestId,
-        attempt,
-        outcome,
-        latencyMs,
-        detail,
+      await this.recordAttempt(item, supplier, requestId, attempt, {
+        outcome: result.ok ? 'ok' : result.reason,
+        detail: result.ok ? null : result.detail,
+        latencyMs: Date.now() - startedAt,
       });
 
       if (result.ok) {
-        return { kind: 'ok', requestId, code: result.code };
+        return { kind: 'issued', code: result.code, verified: false };
       }
       // The supplier looks the request_id up before reserving, so "out of stock" on a
       // retry also proves the call that timed out issued nothing.
       if (result.reason === 'out_of_stock') {
         return { kind: 'out_of_stock' };
       }
-      if (result.reason === 'timeout') {
-        ambiguous = true;
+      if (result.reason === 'timeout' || result.reason === 'error') {
+        unknown = true;
+        sawError ||= result.reason === 'error';
+        sawTimeout ||= result.reason === 'timeout';
       }
       if (attempt < maxAttempts) {
         await sleep(baseDelayMs * 2 ** (attempt - 1));
       }
     }
 
-    return { kind: ambiguous ? 'ambiguous' : 'failed' };
+    // Only "unreachable" answers: nothing was ever sent, nothing can be booked.
+    if (!unknown) {
+      return { kind: 'failed' };
+    }
+
+    // Timeouts or 5xx: ask the book before leaving this supplier. Falling
+    // back or refunding while it holds a code for us is how a customer ends up
+    // with two codes, or with a code and their money.
+    const startedAt = Date.now();
+    const booked = await this.client.lookup(supplier, requestId);
+    const latencyMs = Date.now() - startedAt;
+    if ('error' in booked) {
+      await this.recordAttempt(item, supplier, requestId, attempt, {
+        outcome: booked.error.startsWith('no response') ? 'timeout' : 'error',
+        detail: `book lookup: ${booked.error}`,
+        latencyMs,
+      });
+      return { kind: 'ambiguous' };
+    }
+    if (!booked.found) {
+      // After a 5xx the supplier has finished with the request, so an empty
+      // book is final. After a timeout it is not: the request may still be
+      // in flight on the supplier side, and a code booked a second from now
+      // would become a second code once we move on. Park instead; the next
+      // pass (after the recovery cooldown, or the operator's retry) reads
+      // the book again and then trusts it.
+      if (sawTimeout && !previouslyAmbiguous) {
+        await this.recordAttempt(item, supplier, requestId, attempt, {
+          outcome: 'timeout',
+          detail:
+            'book lookup: nothing booked yet, but the request may still be in flight; checked again on the next pass',
+          latencyMs,
+        });
+        return { kind: 'ambiguous' };
+      }
+      await this.recordAttempt(item, supplier, requestId, attempt, {
+        outcome: 'none_issued',
+        detail: 'book lookup: nothing booked under this request_id',
+        latencyMs,
+      });
+      return { kind: 'failed' };
+    }
+    await this.recordAttempt(item, supplier, requestId, attempt, {
+      outcome: 'ok',
+      detail: 'book lookup: code taken from the supplier book',
+      latencyMs,
+    });
+    if (sawError) {
+      await this.discrepancy(supplier, requestId, item.id, 'error_but_issued', {
+        supplierCode: booked.code,
+        resolution: 'delivered the booked code; no second request made',
+      });
+    }
+    return { kind: 'issued', code: booked.code, verified: true };
+  }
+
+  // A code is delivered only once the supplier's book confirms it and our
+  // deliveries table accepts it. Any disagreement is recorded and the
+  // outcome is either a corrected delivery or a rejection (→ new round).
+  private async accept(
+    item: OrderItem,
+    supplier: string,
+    requestId: string,
+    issued: { code: string; verified: boolean },
+  ): Promise<'delivered' | 'rejected' | 'ambiguous'> {
+    let code = issued.code;
+
+    if (!issued.verified) {
+      const booked = await this.client.lookup(supplier, requestId);
+      if ('error' in booked) {
+        this.logger.warn({
+          event: 'delivery.verify_failed',
+          itemId: item.id,
+          supplier,
+          requestId,
+          detail: booked.error,
+        });
+        return 'ambiguous';
+      }
+      if (!booked.found) {
+        await this.discrepancy(supplier, requestId, item.id, 'unbooked_code', {
+          supplierCode: code,
+          resolution: 'code not delivered; asked again under a new request_id',
+        });
+        await this.recordAttempt(item, supplier, requestId, 0, {
+          outcome: 'rejected',
+          detail: 'answered code is not in the supplier book',
+          latencyMs: 0,
+        });
+        return 'rejected';
+      }
+      if (booked.code !== code) {
+        await this.discrepancy(supplier, requestId, item.id, 'code_mismatch', {
+          supplierCode: code,
+          ourCode: booked.code,
+          resolution: 'delivered the booked code, ignored the answered one',
+        });
+        code = booked.code;
+      }
+    }
+
+    try {
+      await this.complete(item, supplier, requestId, code);
+      return 'delivered';
+    } catch (error) {
+      if (!isDuplicateCode(error)) {
+        throw error;
+      }
+      const holder = await this.dataSource
+        .getRepository(Delivery)
+        .findOneBy({ code });
+      await this.discrepancy(supplier, requestId, item.id, 'duplicate_code', {
+        supplierCode: code,
+        resolution: `code already delivered to item ${holder?.orderItemId ?? '?'}; asked again under a new request_id`,
+      });
+      await this.recordAttempt(item, supplier, requestId, 0, {
+        outcome: 'rejected',
+        detail: 'code already delivered to another item',
+        latencyMs: 0,
+      });
+      return 'rejected';
+    }
+  }
+
+  private async recordAttempt(
+    item: OrderItem,
+    supplier: string,
+    requestId: string,
+    attempt: number,
+    result: {
+      outcome: AttemptOutcome;
+      detail: string | null;
+      latencyMs: number;
+    },
+  ) {
+    await this.dataSource.getRepository(DeliveryAttempt).insert({
+      orderId: item.orderId,
+      orderItemId: item.id,
+      supplier,
+      requestId,
+      attempt,
+      ...result,
+    });
+    this.logger.log({
+      event: 'delivery.attempt',
+      orderId: item.orderId,
+      itemId: item.id,
+      sku: item.sku,
+      supplier,
+      requestId,
+      attempt,
+      ...result,
+    });
+  }
+
+  private async discrepancy(
+    supplier: string,
+    requestId: string,
+    orderItemId: string,
+    kind: DiscrepancyKind,
+    fields: { supplierCode: string; ourCode?: string; resolution: string },
+  ) {
+    await this.dataSource
+      .createQueryBuilder()
+      .insert()
+      .into(SupplierDiscrepancy)
+      .values({
+        supplier,
+        requestId,
+        orderItemId,
+        kind,
+        supplierCode: fields.supplierCode,
+        ourCode: fields.ourCode ?? null,
+        resolution: fields.resolution,
+      })
+      .orIgnore()
+      .execute();
+    this.logger.warn({
+      event: 'supplier.discrepancy',
+      supplier,
+      requestId,
+      itemId: orderItemId,
+      kind,
+      ...fields,
+    });
   }
 
   // Everything that makes one item's delivery final happens in one transaction:
@@ -363,4 +593,12 @@ export class DeliveryService {
       refunded: items.length - delivered,
     });
   }
+}
+
+// Postgres unique violation on deliveries.code: the last line of defence
+// against one code reaching two customers.
+function isDuplicateCode(error: unknown): boolean {
+  if (!(error instanceof QueryFailedError)) return false;
+  const driver = error.driverError as { code?: string; detail?: string };
+  return driver.code === '23505' && /\(code\)=/.test(driver.detail ?? '');
 }

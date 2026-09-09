@@ -12,6 +12,7 @@ import { DeliveryAttempt } from '../delivery/delivery-attempt.entity.js';
 import { Delivery } from '../delivery/delivery.entity.js';
 import { DeliveryWorker } from '../delivery/delivery.worker.js';
 import { Refund } from '../delivery/refund.entity.js';
+import { SupplierDiscrepancy } from '../delivery/supplier-discrepancy.entity.js';
 import { CreateOrderDto } from './dto/create-order.dto.js';
 import { ItemStatus, OrderItem } from './order-item.entity.js';
 import { transitionOrder } from './order-transition.js';
@@ -31,6 +32,8 @@ export class OrdersService {
     @InjectRepository(Refund) private readonly refunds: Repository<Refund>,
     @InjectRepository(DeliveryAttempt)
     private readonly attempts: Repository<DeliveryAttempt>,
+    @InjectRepository(SupplierDiscrepancy)
+    private readonly discrepancies: Repository<SupplierDiscrepancy>,
     private readonly worker: DeliveryWorker,
   ) {}
 
@@ -90,6 +93,10 @@ export class OrdersService {
       this.refunds.findBy({ orderId: id }),
       this.attempts.find({ where: { orderId: id }, order: { id: 'ASC' } }),
     ]);
+    const discrepancies = await this.discrepancies.find({
+      where: { orderItemId: In(items.map((item) => item.id)) },
+      order: { id: 'ASC' },
+    });
     const deliveryOf = new Map(deliveries.map((d) => [d.orderItemId, d]));
     const refundOf = new Map(refunds.map((r) => [r.orderItemId, r]));
 
@@ -147,6 +154,17 @@ export class OrdersService {
         detail: a.detail,
         latencyMs: a.latencyMs,
         at: a.createdAt,
+      })),
+      // Where a supplier's answer or book disagreed with us, and what was done.
+      discrepancies: discrepancies.map((d) => ({
+        itemId: d.orderItemId,
+        supplier: d.supplier,
+        requestId: d.requestId,
+        kind: d.kind,
+        supplierCode: d.supplierCode,
+        ourCode: d.ourCode,
+        resolution: d.resolution,
+        at: d.createdAt,
       })),
     };
   }

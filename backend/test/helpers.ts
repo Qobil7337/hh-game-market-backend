@@ -104,7 +104,7 @@ export async function resetDatabase(app: NestFastifyApplication) {
   await app
     .get(DataSource)
     .query(
-      'TRUNCATE TABLE orders, order_items, payment_events, deliveries, delivery_attempts, refunds, ledger_entries, supplier_keys, psp_refunds, products, product_stock RESTART IDENTITY CASCADE',
+      'TRUNCATE TABLE orders, order_items, payment_events, deliveries, delivery_attempts, refunds, ledger_entries, supplier_discrepancies, supplier_keys, supplier_issues, psp_refunds, products, product_stock RESTART IDENTITY CASCADE',
     );
   await app.get(SeedService).seed();
 }
@@ -141,6 +141,9 @@ export async function setStub(
     timeoutRate?: number;
     hangMs?: number;
     unavailableSkus?: string[];
+    duplicateRate?: number;
+    foreignRate?: number;
+    errorAfterIssueRate?: number;
   },
 ) {
   const { status } = await t.api(
@@ -169,6 +172,19 @@ export function issuedKeys(
     );
 }
 
+// The suppliers' books for this order: what they say they issued, per request_id.
+export function bookOf(
+  app: NestFastifyApplication,
+  orderId: string,
+): Promise<{ supplier: string; code: string; requestId: string }[]> {
+  return app
+    .get(DataSource)
+    .query(
+      'SELECT supplier, code, request_id AS "requestId" FROM supplier_issues WHERE order_id = $1 ORDER BY issued_at',
+      [orderId],
+    );
+}
+
 // What "exactly once, nothing lost, money adds up" boils down to, checked
 // straight in the database once every order in the test has settled.
 export async function expectConsistent(app: NestFastifyApplication) {
@@ -180,7 +196,13 @@ export async function expectConsistent(app: NestFastifyApplication) {
       (SELECT count(*) FROM order_items WHERE status = 'refunded')::int AS refunded_items,
       (SELECT count(*) FROM deliveries)::int AS deliveries,
       (SELECT count(DISTINCT code) FROM deliveries)::int AS distinct_codes,
-      (SELECT count(*) FROM supplier_keys WHERE request_id IS NOT NULL)::int AS issued_keys,
+      (SELECT count(*) FROM deliveries d WHERE NOT EXISTS (
+         SELECT 1 FROM supplier_issues k
+         WHERE k.supplier = d.supplier AND k.request_id = d.request_id AND k.code = d.code))::int AS deliveries_not_in_book,
+      (SELECT count(*) FROM supplier_issues k WHERE NOT EXISTS (
+         SELECT 1 FROM deliveries d WHERE d.request_id = k.request_id))::int AS book_without_delivery,
+      (SELECT count(DISTINCT (supplier, request_id)) FROM supplier_discrepancies
+         WHERE kind IN ('duplicate_code', 'unused_issue', 'unknown_request'))::int AS explained_issues,
       (SELECT count(*) FROM refunds)::int AS refunds,
       (SELECT count(*) FROM psp_refunds)::int AS psp_refunds,
       (SELECT count(*) FROM payment_events WHERE status = 'paid' AND outcome = 'applied')::int AS applied_paid,
@@ -201,10 +223,12 @@ export async function expectConsistent(app: NestFastifyApplication) {
   // One delivery row per delivered item, each with its own code.
   expect(counts.deliveries).toBe(counts.delivered_items);
   expect(counts.distinct_codes).toBe(counts.deliveries);
-  // No key was consumed at the supplier without reaching an item. Only valid
-  // once every order has settled: an ambiguous timeout leaves a key behind
-  // until the retry collects it.
-  expect(counts.issued_keys).toBe(counts.deliveries);
+  // Every delivered code is what its supplier booked under our request_id, and
+  // every booked code we did not deliver has a recorded discrepancy saying why.
+  // Only valid once every order has settled: an ambiguous timeout leaves a
+  // booked code behind until the retry collects it.
+  expect(counts.deliveries_not_in_book).toBe(0);
+  expect(counts.book_without_delivery).toBe(counts.explained_issues);
   // Exactly one paid event was honoured per paid order.
   expect(counts.applied_paid).toBe(counts.paid_orders);
   // One refund per refunded item, and the provider saw each of them once.

@@ -161,9 +161,10 @@ describe('reconciliation and ledger', () => {
       deliveredNotPaid: 0,
       unmatchedEvents: 1,
       paidAfterFailure: 1,
-      supplierKeysWithoutDelivery: 1,
+      supplierIssuesWithoutDelivery: 1,
       moneyMismatches: 0,
       supplierCodeMismatches: 0,
+      supplierDiscrepancies: 0,
     });
     expect(body.paidNotDelivered[0]).toMatchObject({
       id: parked.id,
@@ -175,7 +176,7 @@ describe('reconciliation and ledger', () => {
       outcome: 'order_not_found',
     });
     expect(body.paidAfterFailure[0].eventId).toBe(late.event_id);
-    expect(body.supplierKeysWithoutDelivery[0]).toMatchObject({
+    expect(body.supplierIssuesWithoutDelivery[0]).toMatchObject({
       supplier: 'a',
       orderId: parked.id,
       status: 'delivery_failed',
@@ -195,7 +196,7 @@ describe('reconciliation and ledger', () => {
 
     const after = (await t.api('GET', '/admin/reconciliation')).body;
     expect(after.counts.paidNotDelivered).toBe(0);
-    expect(after.counts.supplierKeysWithoutDelivery).toBe(0);
+    expect(after.counts.supplierIssuesWithoutDelivery).toBe(0);
     expect(after.ledger).toMatchObject({
       cash: 2490,
       customerLiability: 0,
