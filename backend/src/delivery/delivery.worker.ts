@@ -92,15 +92,20 @@ export class DeliveryWorker implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // Atomically takes one paid order and marks it delivering.
+  // Atomically takes the earliest-paid order whose turn has come and marks it
+  // delivering. Orders sent back by a supplier's rate limit wait until their
+  // not_before but keep their paid_at, i.e. their place in the line.
   private claim(): Promise<Order | null> {
     return this.dataSource.transaction(async (em) => {
       const order = await em
         .createQueryBuilder(Order, 'o')
         .setLock('pessimistic_write')
         .setOnLocked('skip_locked')
-        .where('o.status = :status', { status: OrderStatus.Paid })
-        .orderBy('o.updatedAt', 'ASC')
+        .where(
+          'o.status = :status AND (o.notBefore IS NULL OR o.notBefore <= now())',
+          { status: OrderStatus.Paid },
+        )
+        .orderBy('o.paidAt', 'ASC')
         .limit(1)
         .getOne();
 

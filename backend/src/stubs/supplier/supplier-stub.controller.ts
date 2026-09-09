@@ -4,6 +4,8 @@ import {
   Controller,
   Get,
   HttpCode,
+  HttpException,
+  HttpStatus,
   InternalServerErrorException,
   NotFoundException,
   Param,
@@ -79,7 +81,19 @@ class StubConfigDto {
   @Min(0)
   @Max(1)
   errorAfterIssueRate?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  rateLimit?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(100)
+  rateWindowMs?: number;
 }
+
+const TOO_MANY = { status: 'error', reason: 'rate_limited' };
 
 class RestockDto {
   @IsArray()
@@ -111,6 +125,9 @@ export class SupplierStubController {
       dto.sku,
     );
     if (result.status === 'error') {
+      if (result.reason === 'rate_limited') {
+        throw new HttpException(TOO_MANY, HttpStatus.TOO_MANY_REQUESTS);
+      }
       throw result.reason === 'out_of_stock'
         ? new ConflictException(result)
         : new InternalServerErrorException(result);
@@ -120,12 +137,16 @@ export class SupplierStubController {
 
   // The statement: what the supplier has booked. With ?request_id= — one
   // entry (404 if nothing was booked under it); without — everything.
+  // Counts against the same rate limit as /issue.
   @Get('issued')
   async issued(
     @Param('supplier') supplier: string,
     @Query('request_id') requestId?: string,
   ) {
-    const rows = await this.stub.issued(known(supplier), requestId);
+    if (!this.stub.admit(known(supplier))) {
+      throw new HttpException(TOO_MANY, HttpStatus.TOO_MANY_REQUESTS);
+    }
+    const rows = await this.stub.issued(supplier, requestId);
     if (requestId) {
       if (rows.length === 0) {
         throw new NotFoundException({ status: 'error', reason: 'not_found' });

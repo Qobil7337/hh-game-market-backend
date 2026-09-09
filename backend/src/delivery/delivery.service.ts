@@ -21,6 +21,10 @@ import {
 } from './supplier-discrepancy.entity.js';
 import { SupplierClient } from './supplier.client.js';
 
+// No call was made: the supplier's rate limit is spent until nextSlotAt. The
+// item stays pending and the order goes back to the queue, keeping its place.
+type Deferred = { kind: 'deferred'; nextSlotAt: Date };
+
 type IssueOutcome =
   // The supplier answered with a code (or its book showed one after a
   // non-answer). Not yet trusted: `verified` says whether it came from the book.
@@ -30,13 +34,24 @@ type IssueOutcome =
   // Definitive: nothing is booked for us (never reached it, or the book is empty).
   | { kind: 'failed' }
   // Could not find out: answers and the book lookup both failed.
-  | { kind: 'ambiguous' };
+  | { kind: 'ambiguous' }
+  | Deferred;
 
 type SupplierOutcome =
   | { kind: 'delivered' }
   | { kind: 'out_of_stock' }
   | { kind: 'failed' }
-  | { kind: 'ambiguous' };
+  | { kind: 'ambiguous' }
+  | Deferred;
+
+// What one pass over an item leaves behind for the order's verdict.
+interface ItemResult {
+  // Still pending because of a supplier's rate limit; try again at this time.
+  deferredUntil?: Date;
+  // Still open for a reason only a later pass can settle (ambiguous supplier,
+  // refund call failed).
+  unresolved?: boolean;
+}
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -65,14 +80,24 @@ export class DeliveryService {
   // are already delivered or refunded are skipped, the rest pick up where they
   // stopped, with the same request_ids.
   async deliver(order: Order): Promise<void> {
+    let deferredUntil: Date | undefined;
+    let unresolved = false;
     for (const item of await this.items(order.id)) {
+      let result: ItemResult = {};
       if (item.status === ItemStatus.Pending) {
-        await this.deliverItem(order, item);
+        result = await this.deliverItem(order, item);
       } else if (item.status === ItemStatus.Refunding) {
-        await this.refund(order, item);
+        result = { unresolved: !(await this.refund(order, item)) };
       }
+      if (
+        result.deferredUntil &&
+        (!deferredUntil || result.deferredUntil > deferredUntil)
+      ) {
+        deferredUntil = result.deferredUntil;
+      }
+      unresolved ||= result.unresolved ?? false;
     }
-    await this.finish(order);
+    await this.finish(order, { deferredUntil, unresolved });
   }
 
   private items(orderId: string) {
@@ -81,7 +106,10 @@ export class DeliveryService {
       .find({ where: { orderId }, order: { position: 'ASC' } });
   }
 
-  private async deliverItem(order: Order, item: OrderItem) {
+  private async deliverItem(
+    order: Order,
+    item: OrderItem,
+  ): Promise<ItemResult> {
     const chain = await this.supplierChain(item);
     const outcomes: SupplierOutcome[] = [];
 
@@ -90,7 +118,13 @@ export class DeliveryService {
       outcomes.push(outcome);
 
       if (outcome.kind === 'delivered') {
-        return;
+        return {};
+      }
+      if (outcome.kind === 'deferred') {
+        // Not a failure: the supplier is simply busy. No fallback either — a
+        // second supplier for a rate-limited one would double the load and
+        // change who stocks the SKU; the item waits for its slot.
+        return { deferredUntil: outcome.nextSlotAt };
       }
       if (outcome.kind === 'ambiguous') {
         // The supplier may hold a code for this item: neither a fallback nor a
@@ -102,7 +136,7 @@ export class DeliveryService {
           supplier,
           reason: `${supplier} gave no definite answer and its book is unreachable; must not fall back`,
         });
-        return;
+        return { unresolved: true };
       }
       // out_of_stock and definitive failures leave nothing behind: safe to move on.
     }
@@ -124,7 +158,7 @@ export class DeliveryService {
     );
     item.status = ItemStatus.Refunding;
     item.refundReason = reason;
-    await this.refund(order, item);
+    return { unresolved: !(await this.refund(order, item)) };
   }
 
   // Suppliers in the order they should be tried: the one that stocks the SKU
@@ -196,8 +230,8 @@ export class DeliveryService {
         return issued;
       }
       const accepted = await this.accept(item, supplier, requestId, issued);
-      if (accepted !== 'rejected') {
-        return { kind: accepted };
+      if (accepted.kind !== 'rejected') {
+        return accepted;
       }
     }
     // Rounds exhausted: this supplier keeps handing out codes we cannot use.
@@ -236,6 +270,10 @@ export class DeliveryService {
         order.id,
         item.sku,
       );
+      if (!result.ok && result.reason === 'rate_limited') {
+        // Nothing was sent, so nothing to record as an attempt.
+        return { kind: 'deferred', nextSlotAt: result.nextSlotAt };
+      }
       await this.recordAttempt(item, supplier, requestId, attempt, {
         outcome: result.ok ? 'ok' : result.reason,
         detail: result.ok ? null : result.detail,
@@ -271,6 +309,9 @@ export class DeliveryService {
     const startedAt = Date.now();
     const booked = await this.client.lookup(supplier, requestId);
     const latencyMs = Date.now() - startedAt;
+    if ('deferred' in booked) {
+      return { kind: 'deferred', nextSlotAt: booked.deferred };
+    }
     if ('error' in booked) {
       await this.recordAttempt(item, supplier, requestId, attempt, {
         outcome: booked.error.startsWith('no response') ? 'timeout' : 'error',
@@ -324,12 +365,31 @@ export class DeliveryService {
     supplier: string,
     requestId: string,
     issued: { code: string; verified: boolean },
-  ): Promise<'delivered' | 'rejected' | 'ambiguous'> {
+  ): Promise<
+    | { kind: 'delivered' }
+    | { kind: 'rejected' }
+    | { kind: 'ambiguous' }
+    | Deferred
+  > {
     let code = issued.code;
 
     if (!issued.verified) {
       const booked = await this.client.lookup(supplier, requestId);
+      if ('deferred' in booked) {
+        // The next pass re-issues under the same request_id (same code, by
+        // contract) and verifies then.
+        return { kind: 'deferred', nextSlotAt: booked.deferred };
+      }
       if ('error' in booked) {
+        // Written down as an attempt on purpose: the supplier answered "ok",
+        // so it holds a code for us, and the next pass must come back here
+        // (supplierChain treats a trailing timeout/error as "still open")
+        // instead of asking anyone else.
+        await this.recordAttempt(item, supplier, requestId, 0, {
+          outcome: booked.error.startsWith('no response') ? 'timeout' : 'error',
+          detail: `book verify: ${booked.error}`,
+          latencyMs: 0,
+        });
         this.logger.warn({
           event: 'delivery.verify_failed',
           itemId: item.id,
@@ -337,7 +397,7 @@ export class DeliveryService {
           requestId,
           detail: booked.error,
         });
-        return 'ambiguous';
+        return { kind: 'ambiguous' };
       }
       if (!booked.found) {
         await this.discrepancy(supplier, requestId, item.id, 'unbooked_code', {
@@ -349,7 +409,7 @@ export class DeliveryService {
           detail: 'answered code is not in the supplier book',
           latencyMs: 0,
         });
-        return 'rejected';
+        return { kind: 'rejected' };
       }
       if (booked.code !== code) {
         await this.discrepancy(supplier, requestId, item.id, 'code_mismatch', {
@@ -363,7 +423,7 @@ export class DeliveryService {
 
     try {
       await this.complete(item, supplier, requestId, code);
-      return 'delivered';
+      return { kind: 'delivered' };
     } catch (error) {
       if (!isDuplicateCode(error)) {
         throw error;
@@ -380,7 +440,7 @@ export class DeliveryService {
         detail: 'code already delivered to another item',
         latencyMs: 0,
       });
-      return 'rejected';
+      return { kind: 'rejected' };
     }
   }
 
@@ -494,7 +554,7 @@ export class DeliveryService {
   // The item is already `refunding`. Two steps, each safe to repeat: the
   // provider call carries the item id as its idempotency key, and the booking
   // is a primary-key insert plus a compare-and-set on the item.
-  private async refund(order: Order, item: OrderItem) {
+  private async refund(order: Order, item: OrderItem): Promise<boolean> {
     const result = await this.psp.refund(
       item.id,
       order.id,
@@ -509,7 +569,7 @@ export class DeliveryService {
         itemId: item.id,
         detail: result.detail,
       });
-      return;
+      return false;
     }
 
     await this.dataSource.transaction(async (em) => {
@@ -543,17 +603,40 @@ export class DeliveryService {
       amount: item.amount,
       reason: item.refundReason,
     });
+    return true;
   }
 
   // Derives the order's outcome from its items: final only when every item is
-  // either delivered or refunded, parked for a retry otherwise.
-  private async finish(order: Order) {
+  // either delivered or refunded; back in the queue when only a rate limit is
+  // in the way; parked for a retry otherwise.
+  private async finish(
+    order: Order,
+    pass: { deferredUntil?: Date; unresolved: boolean },
+  ) {
     const items = await this.items(order.id);
     const open = items.filter(
       (item) =>
         item.status === ItemStatus.Pending ||
         item.status === ItemStatus.Refunding,
     );
+    if (open.length > 0 && pass.deferredUntil && !pass.unresolved) {
+      // Back to `paid` with its original paid_at, so it keeps its place in
+      // the queue, and a not_before so the worker does not spin on it.
+      await transitionOrder(
+        this.dataSource.manager,
+        order.id,
+        OrderStatus.Delivering,
+        OrderStatus.Paid,
+        { notBefore: pass.deferredUntil },
+      );
+      this.logger.log({
+        event: 'delivery.queued',
+        orderId: order.id,
+        notBefore: pass.deferredUntil,
+        reason: `${open.length} of ${items.length} item(s) waiting for a supplier slot`,
+      });
+      return;
+    }
     if (open.length > 0) {
       await transitionOrder(
         this.dataSource.manager,

@@ -30,8 +30,9 @@ export function transitionOrder(
   id: string,
   from: OrderStatus,
   to: OrderStatus,
+  extra: Partial<Pick<Order, 'paidAt' | 'notBefore'>> = {},
 ) {
-  return transition(em, Order, id, from, to);
+  return transition(em, Order, id, from, to, extra);
 }
 
 export function transitionItem(

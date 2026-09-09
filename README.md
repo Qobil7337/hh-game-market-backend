@@ -44,7 +44,7 @@ npm test
 > сконфигурированную базу** (`TRUNCATE`) и засевают её заново. Не запускайте
 > их против базы с нужными данными.
 
-40 e2e-тестов в `backend/test/`:
+44 e2e-теста в `backend/test/`:
 
 | Файл | Что проверяет |
 | --- | --- |
@@ -55,6 +55,7 @@ npm test
 | `catalog.e2e-spec.ts` | этап 5: витрина с keyset-пагинацией, списание остатка, план запроса на 5 000 SKU идёт по индексу |
 | `multi-item.e2e-spec.ts` | **второе задание, задача 1**: три позиции от двух поставщиков; одна позиция не выдаётся → возврат, остальное у покупателя; ничего не выдаётся → полный возврат; воркер умер между позициями → recovery дожимает без второго кода; платёжка отвергла возврат → повтор платит ровно один раз; хаос на 12 заказов × 3 позиции — у каждого заказа оплачено = выдано + возвращено |
 | `untrusted.e2e-spec.ts` | **второе задание, задача 2**: поставщик прислал чужой (уже выданный) код → отклонён, три новых `request_id`, затем запасной поставщик; в ответе один код, в книге другой → выдан тот, что в книге; 5xx после выдачи → код взят из книги, второго запроса нет; аудит книги находит то, чего проход не видел, и ровно один раз; хаос с ложью, 5xx и зависаниями на обоих — каждый выданный код есть в книге, ни один не выдан дважды |
+| `burst.e2e-spec.ts` | **второе задание, задача 3**: 12 заказов при лимите 4 запроса / 2 с — очередь видна, всё выдано, поставщик не отклонил ни одного запроса и не видел больше лимита в окне; оплаченные выдаются в порядке оплаты, неоплаченные к поставщику не ходят; лимит A не тормозит заказы B; заказ в очереди переживает рестарт — его забирает второй экземпляр |
 
 Каждый тест заканчивается проверкой инвариантов прямо в базе
 (`expectConsistent` в `test/helpers.ts`): число выдач = число выданных позиций
@@ -127,8 +128,8 @@ curl -X POST http://localhost:3000/api/admin/recovery # прогнать вос�
 Логи — по строке JSON на событие (`LOG_FORMAT=json`): `payment.webhook`,
 `delivery.attempt`, `delivery.item_delivered`, `delivery.item_unresolved`,
 `delivery.verify_failed`, `supplier.discrepancy`, `supplier.audit`,
-`refund.completed`, `refund.failed`, `delivery.completed`, `delivery.parked`,
-`recovery.sweep`.
+`refund.completed`, `refund.failed`, `delivery.completed`, `delivery.queued`
+(отложен лимитом), `delivery.parked`, `recovery.sweep`.
 
 ### Каталог под нагрузкой (этап 5)
 
@@ -259,6 +260,52 @@ curl -X POST http://localhost:3000/api/admin/supplier-audit   # {"checked":{"a":
 curl http://localhost:3000/api/admin/reconciliation           # supplierDiscrepancies, supplierIssuesWithoutDelivery, supplierCodeMismatches
 ```
 
+### Задача 3. Всплеск заказов и лимит поставщика
+
+Лимит держится **у нас**, до вызова: `SUPPLIER_RATE_LIMIT` запросов на
+поставщика в любое скользящее окно `SUPPLIER_RATE_WINDOW_MS`, счётчик — в
+Postgres (`supplier_calls`), поэтому все экземпляры приложения тратят один
+бюджет. Одна выдача стоит два запроса (issue + обязательная сверка с книгой)
+и бронирует оба сразу. Нет слота — заказ **не ждёт в воркере**, а возвращается
+в очередь: `paid` с `not_before` = момент, когда освободится слот, и с прежним
+`paid_at`, то есть на своём месте. Очередь — по-прежнему таблица заказов,
+поэтому ничего не теряется и при рестарте.
+
+```bash
+npm run stub -- a --reset --rate-limit 4 --rate-window-ms 2000   # A принимает 4 запроса за 2 с (сверх — 429)
+# в backend/.env: SUPPLIER_A_RATE_LIMIT=4, SUPPLIER_RATE_WINDOW_MS=2000, затем перезапуск
+for i in $(seq 1 12); do npm run pay -- --sku KEY-GTA5 > /dev/null & done; wait
+curl http://localhost:3000/api/admin/queue
+```
+
+```json
+{
+  "orders": { "awaitingPayment": 0, "queued": 0, "waitingForSlot": 8, "delivering": 2, "delivered": 2, … },
+  "items": { "open": 10, "delivered": 2, "refunded": 0 },
+  "suppliers": { "a": { "limit": 4, "windowMs": 2000, "used": 4, "available": 0, "nextSlotInMs": 1730 }, "b": { … } }
+}
+```
+
+Через несколько окон `delivered: 12`, а у заглушки
+(`npm run stub -- a`) — `calls: { total: 24, rejected: 0, peakInWindow: 4 }`:
+она сама считает, сколько запросов пришло и сколько было в одном окне —
+это и есть проверка «лимит не превышен».
+
+- **Ничего не теряется** — очередь в базе, не в памяти; заказ, отложенный
+  лимитом, остаётся `paid` и будет забран любым экземпляром.
+- **Лимит не превышается** — слот берётся до запроса, атомарно
+  (`pg_advisory_xact_lock` на поставщика + счёт в окне), наше окно на 100 мс
+  длиннее окна поставщика, чтобы дрожание сети не сблизило два запроса.
+- **Оплаченные раньше неоплаченных** — к поставщику ходят только оплаченные
+  заказы: неоплаченный (`created`) в очереди выдачи не существует и слот
+  занять не может; среди оплаченных порядок — по `paid_at`, и отложенный
+  лимитом заказ своё место не теряет. Фоновая работа (аудит книги) берёт
+  только то, что осталось от выдач.
+- **Прогресс** — `GET /admin/queue`: заказы по стадиям (`queued`,
+  `waitingForSlot`, `delivering`, `delivered`, …), открытые позиции и
+  использование лимита по каждому поставщику; лимит одного поставщика не
+  задерживает заказы другого — отложенный заказ освобождает дорожку.
+
 ## API
 
 Префикс `/api`. Тела — JSON.
@@ -273,8 +320,8 @@ curl http://localhost:3000/api/admin/reconciliation           # supplierDiscrepa
 | `POST /webhooks/payment` | вебхук платёжки по контракту; всегда `200` после записи события |
 | `POST /stubs/suppliers/{a\|b}/issue` | заглушка поставщика по контракту |
 | `GET /stubs/suppliers/{a\|b}/issued?request_id=` | книга поставщика: запись под `request_id` (404, если нет) или вся выписка |
-| `GET /stubs/suppliers/{a\|b}` | конфиг сбоев и остаток пула |
-| `PUT /stubs/suppliers/{a\|b}/config` `{errorRate, timeoutRate, hangMs, unavailableSkus, duplicateRate, foreignRate, errorAfterIssueRate}` | доля 5xx / зависаний / лжи (0..1), SKU «нет в наличии» |
+| `GET /stubs/suppliers/{a\|b}` | конфиг сбоев, остаток пула, статистика запросов (`calls`) |
+| `PUT /stubs/suppliers/{a\|b}/config` `{errorRate, timeoutRate, hangMs, unavailableSkus, duplicateRate, foreignRate, errorAfterIssueRate, rateLimit, rateWindowMs}` | доля 5xx / зависаний / лжи (0..1), SKU «нет в наличии», лимит запросов в окно (сверх — 429); сбрасывает `calls` |
 | `POST /stubs/suppliers/{a\|b}/keys` `{codes[]}` | пополнить пул |
 | `POST /stubs/payments/refund` `{refund_id, order_id, amount, currency}` | заглушка платёжки: возврат, идемпотентный по `refund_id` |
 | `GET /stubs/payments` | конфиг и сколько возвратов получила платёжка |
@@ -282,6 +329,7 @@ curl http://localhost:3000/api/admin/reconciliation           # supplierDiscrepa
 | `GET /admin/reconciliation` | сверка + балансы журнала + расхождения с поставщиками |
 | `POST /admin/recovery` | прогнать восстановление сейчас |
 | `POST /admin/supplier-audit` | сверить книги поставщиков с выдачами сейчас |
+| `GET /admin/queue` | прогресс очереди: заказы по стадиям, открытые позиции, лимиты поставщиков |
 | `PUT /admin/stock/:sku` `{available}` | выставить остаток на витрине |
 | `POST /admin/catalog/generate` `{count}` | сгенерировать SKU для нагрузочных экспериментов |
 | `GET /admin/explain?…` | план витринного запроса |
@@ -302,7 +350,8 @@ created ──paid──▶ paid ──▶ delivering ──▶ delivered       
 
 Позиция (`items[].status`): `pending` → `delivered` | `refunding` → `refunded`.
 `refunding` — решение о возврате уже записано, платёжке ещё не удалось его
-провести.
+провести. `paid` — это и есть очередь выдачи (по `paid_at`); заказ, отложенный
+лимитом поставщика, возвращается в `paid` с `not_before`.
 
 ## Конфигурация (`backend/.env`)
 
@@ -318,6 +367,8 @@ created ──paid──▶ paid ──▶ delivering ──▶ delivered       
 | `SUPPLIER_RETRY_BASE_MS` | `500` | база экспоненциального бэкоффа (500, 1000, …) |
 | `SUPPLIER_MAX_ROUNDS` | `3` | новых `request_id` на поставщика после отклонённого кода |
 | `SUPPLIER_AUDIT_INTERVAL_MS` | `60000` | период сверки книг поставщиков с выдачами |
+| `SUPPLIER_RATE_LIMIT` `SUPPLIER_{A,B}_RATE_LIMIT` | `0` (без лимита) | наших запросов к поставщику в окно; на поставщика — приоритетнее общего |
+| `SUPPLIER_RATE_WINDOW_MS` | `60000` | окно лимита |
 | `DELIVERY_CONCURRENCY` | `4` | параллельных выдач в одном экземпляре |
 | `DELIVERY_POLL_INTERVAL_MS` | `2000` | страховочный опрос очереди |
 | `PSP_URL` `PSP_TIMEOUT_MS` | `http://localhost:3000/api/stubs/payments` `3000` | заглушка платёжки для возвратов |
@@ -325,6 +376,7 @@ created ──paid──▶ paid ──▶ delivering ──▶ delivered       
 | `DELIVERY_STALE_AFTER_MS` | `60000` | `delivering` старше — считаем зависшим |
 | `RECOVERY_RETRY_AFTER_MS` | `60000` | пауза перед повтором запаркованных |
 | `STUB_{A,B}_ERROR_RATE` `STUB_{A,B}_TIMEOUT_RATE` `STUB_HANG_MS` `STUB_PSP_ERROR_RATE` | `0` `0` `10000` `0` | стартовые настройки заглушек |
+| `STUB_{A,B}_RATE_LIMIT` `STUB_RATE_WINDOW_MS` | `0` `60000` | сколько запросов в окно принимает заглушка поставщика (сверх — 429) |
 
 ## Структура
 
@@ -332,10 +384,10 @@ created ──paid──▶ paid ──▶ delivering ──▶ delivered       
 backend/src/
 ├── orders/      Order, OrderItem + статусы, transitionOrder()/transitionItem() (compare-and-set), POST/GET /orders
 ├── payments/    PaymentEvent (event_id — PK), обработчик вебхука
-├── delivery/    Delivery, Refund, DeliveryAttempt, SupplierDiscrepancy, воркер (SKIP LOCKED), политика поставщиков, возвраты, recovery, аудит книг
+├── delivery/    Delivery, Refund, DeliveryAttempt, SupplierDiscrepancy, воркер (SKIP LOCKED), политика поставщиков, возвраты, recovery, аудит книг, лимит запросов (SupplierLimiter)
 ├── ledger/      двойная запись: cash / customer_liability / revenue (оплата, выдача, возврат)
 ├── catalog/     Product (+ supplier), ProductStock, витрина
-├── admin/       сверка, recovery, генератор каталога, EXPLAIN
+├── admin/       сверка, прогресс очереди, recovery, аудит, генератор каталога, EXPLAIN
 ├── stubs/       заглушки: поставщики с инъекцией сбоев и лжи (+ их книга), платёжка (возвраты)
 └── seed/        каталог и пул ключей из приложения к заданию
 backend/test/    e2e-тесты (vitest)

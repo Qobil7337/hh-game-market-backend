@@ -9,7 +9,8 @@
 //   node scripts/stub.mjs a --duplicate-rate 1       A hands out codes it already issued
 //   node scripts/stub.mjs a --foreign-rate 1         A books one code, answers with another
 //   node scripts/stub.mjs a --error-after-issue-rate 1   A books the code, then answers 5xx
-//   node scripts/stub.mjs a --reset                  back to healthy
+//   node scripts/stub.mjs a --rate-limit 10 --rate-window-ms 60000   A accepts 10 requests a minute
+//   node scripts/stub.mjs a --reset                  back to healthy (also clears call statistics)
 //   node scripts/stub.mjs b --restock KEY-1,KEY-2    add keys to B's pool
 //   node scripts/stub.mjs psp --error-rate 1         payment provider rejects refunds
 import { parseArgs } from 'node:util';
@@ -25,6 +26,8 @@ const { values: opts, positionals } = parseArgs({
     'duplicate-rate': { type: 'string' },
     'foreign-rate': { type: 'string' },
     'error-after-issue-rate': { type: 'string' },
+    'rate-limit': { type: 'string' },
+    'rate-window-ms': { type: 'string' },
     reset: { type: 'boolean', default: false },
     restock: { type: 'string' },
   },
@@ -61,6 +64,7 @@ if (opts.reset) {
           duplicateRate: 0,
           foreignRate: 0,
           errorAfterIssueRate: 0,
+          rateLimit: 0,
         },
   );
 }
@@ -68,6 +72,8 @@ for (const [flag, key] of [
   ['duplicate-rate', 'duplicateRate'],
   ['foreign-rate', 'foreignRate'],
   ['error-after-issue-rate', 'errorAfterIssueRate'],
+  ['rate-limit', 'rateLimit'],
+  ['rate-window-ms', 'rateWindowMs'],
 ]) {
   if (opts[flag] !== undefined) patch[key] = Number(opts[flag]);
 }

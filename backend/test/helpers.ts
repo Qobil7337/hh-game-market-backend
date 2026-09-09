@@ -57,6 +57,10 @@ export async function startApp(): Promise<TestApp> {
   process.env.SUPPLIER_A_URL = `${baseUrl}/stubs/suppliers/a`;
   process.env.SUPPLIER_B_URL = `${baseUrl}/stubs/suppliers/b`;
   process.env.PSP_URL = `${baseUrl}/stubs/payments`;
+  // Unlimited unless a test says otherwise, whatever backend/.env holds.
+  process.env.SUPPLIER_RATE_LIMIT ??= '0';
+  process.env.STUB_A_RATE_LIMIT ??= '0';
+  process.env.STUB_B_RATE_LIMIT ??= '0';
 
   const api = async (method: string, path: string, body?: unknown) => {
     const response = await fetch(`${baseUrl}${path}`, {
@@ -104,7 +108,7 @@ export async function resetDatabase(app: NestFastifyApplication) {
   await app
     .get(DataSource)
     .query(
-      'TRUNCATE TABLE orders, order_items, payment_events, deliveries, delivery_attempts, refunds, ledger_entries, supplier_discrepancies, supplier_keys, supplier_issues, psp_refunds, products, product_stock RESTART IDENTITY CASCADE',
+      'TRUNCATE TABLE orders, order_items, payment_events, deliveries, delivery_attempts, refunds, ledger_entries, supplier_discrepancies, supplier_calls, supplier_keys, supplier_issues, psp_refunds, products, product_stock RESTART IDENTITY CASCADE',
     );
   await app.get(SeedService).seed();
 }
@@ -144,6 +148,8 @@ export async function setStub(
     duplicateRate?: number;
     foreignRate?: number;
     errorAfterIssueRate?: number;
+    rateLimit?: number;
+    rateWindowMs?: number;
   },
 ) {
   const { status } = await t.api(

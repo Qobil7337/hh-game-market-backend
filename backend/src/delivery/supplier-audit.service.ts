@@ -58,6 +58,7 @@ export class SupplierAuditService implements OnModuleInit, OnModuleDestroy {
     const suppliers = this.config.get<string>('SUPPLIERS', 'a,b').split(',');
     const checked: Record<string, number> = {};
     const unreachable: string[] = [];
+    const deferred: string[] = [];
     const found: (Found | undefined)[] = [];
 
     for (const supplier of suppliers) {
@@ -66,6 +67,11 @@ export class SupplierAuditService implements OnModuleInit, OnModuleDestroy {
         entries = await this.client.statement(supplier);
       } catch {
         unreachable.push(supplier);
+        continue;
+      }
+      if (entries === null) {
+        // Rate limit spent on deliveries, which come first; next interval.
+        deferred.push(supplier);
         continue;
       }
       checked[supplier] = entries.length;
@@ -157,10 +163,11 @@ export class SupplierAuditService implements OnModuleInit, OnModuleDestroy {
         event: 'supplier.audit',
         checked,
         unreachable,
+        deferred,
         found: fresh,
       });
     }
-    return { checked, unreachable, found: fresh };
+    return { checked, unreachable, deferred, found: fresh };
   }
 
   // Inserts once; returns the finding only when it is new.

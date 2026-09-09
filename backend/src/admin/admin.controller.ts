@@ -13,6 +13,7 @@ import { CatalogService } from '../catalog/catalog.service.js';
 import { StorefrontQueryDto } from '../catalog/dto/storefront-query.dto.js';
 import { RecoveryService } from '../delivery/recovery.service.js';
 import { SupplierAuditService } from '../delivery/supplier-audit.service.js';
+import { ProgressService } from './progress.service.js';
 import { ReconciliationService } from './reconciliation.service.js';
 
 class SetStockDto {
@@ -36,12 +37,19 @@ export class AdminController {
     private readonly reconciliation: ReconciliationService,
     private readonly recovery: RecoveryService,
     private readonly audit: SupplierAuditService,
+    private readonly progress: ProgressService,
     private readonly catalog: CatalogService,
   ) {}
 
   @Get('reconciliation')
   reconcile() {
     return this.reconciliation.report();
+  }
+
+  // Queue progress: orders by stage, open items, rate-limit usage per supplier.
+  @Get('queue')
+  queue() {
+    return this.progress.snapshot();
   }
 
   // Runs the recovery sweep now instead of waiting for the next interval.

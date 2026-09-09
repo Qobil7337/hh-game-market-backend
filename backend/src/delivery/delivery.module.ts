@@ -12,7 +12,9 @@ import { PspClient } from './psp.client.js';
 import { RecoveryService } from './recovery.service.js';
 import { Refund } from './refund.entity.js';
 import { SupplierAuditService } from './supplier-audit.service.js';
+import { SupplierCall } from './supplier-call.entity.js';
 import { SupplierDiscrepancy } from './supplier-discrepancy.entity.js';
+import { SupplierLimiter } from './supplier-limiter.service.js';
 import { SupplierClient } from './supplier.client.js';
 
 @Module({
@@ -22,6 +24,7 @@ import { SupplierClient } from './supplier.client.js';
       DeliveryAttempt,
       Refund,
       SupplierDiscrepancy,
+      SupplierCall,
       Order,
       OrderItem,
     ]),
@@ -33,6 +36,7 @@ import { SupplierClient } from './supplier.client.js';
     DeliveryService,
     RecoveryService,
     SupplierAuditService,
+    SupplierLimiter,
     SupplierClient,
     PspClient,
   ],
@@ -40,6 +44,7 @@ import { SupplierClient } from './supplier.client.js';
     DeliveryWorker,
     RecoveryService,
     SupplierAuditService,
+    SupplierLimiter,
     TypeOrmModule,
   ],
 })

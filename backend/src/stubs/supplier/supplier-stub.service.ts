@@ -22,17 +22,36 @@ export interface StubConfig {
   foreignRate: number;
   // books the code, then answers 5xx anyway.
   errorAfterIssueRate: number;
+  // Requests accepted per rateWindowMs across every endpoint; 0 = unlimited.
+  // Anything beyond is answered 429 and counted as rejected.
+  rateLimit: number;
+  rateWindowMs: number;
+}
+
+// What the supplier saw: every request that arrived, how many it turned
+// away, and the most it ever saw inside one window. The last number is the
+// proof that the caller never exceeded the limit.
+export interface CallStats {
+  total: number;
+  rejected: number;
+  peakInWindow: number;
 }
 
 export type StubIssueResult =
   | { status: 'ok'; request_id: string; code: string }
-  | { status: 'error'; reason: 'out_of_stock' | 'internal_error' };
+  | {
+      status: 'error';
+      reason: 'out_of_stock' | 'internal_error' | 'rate_limited';
+    };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 @Injectable()
 export class SupplierStubService {
   private readonly configs = new Map<string, StubConfig>();
+  // Arrival times of every request, per supplier (test tooling, in memory).
+  private readonly arrivals = new Map<string, number[]>();
+  private readonly stats = new Map<string, CallStats>();
 
   constructor(
     private readonly dataSource: DataSource,
@@ -48,7 +67,10 @@ export class SupplierStubService {
         duplicateRate: 0,
         foreignRate: 0,
         errorAfterIssueRate: 0,
+        rateLimit: Number(config.get(`${prefix}_RATE_LIMIT`, 0)),
+        rateWindowMs: Number(config.get('STUB_RATE_WINDOW_MS', 60_000)),
       });
+      this.resetStats(supplier);
     }
   }
 
@@ -56,6 +78,7 @@ export class SupplierStubService {
     return this.configs.get(supplier)!;
   }
 
+  // Also starts the call statistics afresh, so a scenario measures only itself.
   setConfig(supplier: string, patch: Partial<StubConfig>): StubConfig {
     const next = { ...this.getConfig(supplier) };
     // A validated DTO carries every declared field, absent ones as undefined, so a
@@ -64,7 +87,32 @@ export class SupplierStubService {
       if (value !== undefined) (next as Record<string, unknown>)[key] = value;
     }
     this.configs.set(supplier, next);
+    this.resetStats(supplier);
     return next;
+  }
+
+  private resetStats(supplier: string) {
+    this.arrivals.set(supplier, []);
+    this.stats.set(supplier, { total: 0, rejected: 0, peakInWindow: 0 });
+  }
+
+  // Counts one arriving request against the limit. False = turned away.
+  admit(supplier: string): boolean {
+    const { rateLimit, rateWindowMs } = this.getConfig(supplier);
+    const now = Date.now();
+    const arrivals = this.arrivals.get(supplier)!;
+    const stats = this.stats.get(supplier)!;
+    while (arrivals.length > 0 && arrivals[0] <= now - rateWindowMs) {
+      arrivals.shift();
+    }
+    arrivals.push(now);
+    stats.total++;
+    stats.peakInWindow = Math.max(stats.peakInWindow, arrivals.length);
+    if (rateLimit > 0 && arrivals.length > rateLimit) {
+      stats.rejected++;
+      return false;
+    }
+    return true;
   }
 
   async status(supplier: string) {
@@ -76,7 +124,12 @@ export class SupplierStubService {
        FROM supplier_keys WHERE supplier = $1`,
       [supplier],
     );
-    return { supplier, config: this.getConfig(supplier), stock };
+    return {
+      supplier,
+      config: this.getConfig(supplier),
+      stock,
+      calls: this.stats.get(supplier),
+    };
   }
 
   async restock(supplier: string, codes: string[]) {
@@ -118,6 +171,9 @@ export class SupplierStubService {
     const { errorRate, unavailableSkus, foreignRate, errorAfterIssueRate } =
       this.getConfig(supplier);
 
+    if (!this.admit(supplier)) {
+      return { status: 'error', reason: 'rate_limited' };
+    }
     // A failure drawn here happens before anything is written: the definitive kind.
     if (Math.random() < errorRate) {
       return { status: 'error', reason: 'internal_error' };
